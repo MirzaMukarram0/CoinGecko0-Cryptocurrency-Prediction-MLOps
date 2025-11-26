@@ -152,8 +152,8 @@ minio-data/
 postgres-data/
 
 # Model artifacts (if not tracked by DVC)
-models/
-artifacts/
+# Keep data/models for DVC tracking
+!data/models/
 
 # Configuration files with sensitive data
 config/local/
