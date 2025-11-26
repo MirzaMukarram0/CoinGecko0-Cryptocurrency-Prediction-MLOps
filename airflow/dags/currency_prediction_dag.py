@@ -419,17 +419,19 @@ def profiling_task(**context):
 
 
 # ============================================================================
-# TASK 5: STORAGE UPLOAD (Step 2.3)
+# TASK 5: STORAGE UPLOAD (Step 2.3) - MinIO S3-Compatible Remote Storage
 # ============================================================================
 def storage_upload_task(**context):
     """
-    Upload processed data to cloud-like object storage.
-    Uses local storage as fallback.
+    Upload processed data to MinIO S3-compatible remote storage.
+    MinIO provides S3-compatible object storage that runs locally via Docker.
     """
     import shutil
+    import boto3
+    from botocore.client import Config
     
     logger.info("=" * 60)
-    logger.info("STARTING STORAGE UPLOAD")
+    logger.info("STARTING STORAGE UPLOAD TO MINIO")
     logger.info("=" * 60)
     
     # Get processed filepath
@@ -440,23 +442,89 @@ def storage_upload_task(**context):
     if not processed_filepath or not os.path.exists(processed_filepath):
         raise FileNotFoundError(f"Processed file not found: {processed_filepath}")
     
-    # Create storage directory
-    storage_dir = os.path.join(BASE_DIR, 'storage', 'processed_data')
-    os.makedirs(storage_dir, exist_ok=True)
-    
-    # Copy file to storage
     filename = os.path.basename(processed_filepath)
-    storage_path = os.path.join(storage_dir, filename)
-    shutil.copy2(processed_filepath, storage_path)
     
-    logger.info(f"✓ File uploaded to storage: {storage_path}")
+    # MinIO configuration
+    minio_endpoint = os.environ.get('MINIO_ENDPOINT', 'minio:9000')
+    minio_access_key = os.environ.get('MINIO_ACCESS_KEY', 'minioadmin')
+    minio_secret_key = os.environ.get('MINIO_SECRET_KEY', 'minioadmin')
+    bucket_name = os.environ.get('MINIO_BUCKET', 'mlops-data')
+    
+    logger.info(f"MinIO Endpoint: {minio_endpoint}")
+    logger.info(f"Bucket: {bucket_name}")
     
     storage_result = {
         'source_file': processed_filepath,
-        'storage_path': storage_path,
-        'storage_type': 'local',
-        'success': True
+        'storage_path': None,
+        'storage_type': 'minio',
+        'success': False,
+        'bucket': bucket_name,
+        'object_key': None
     }
+    
+    try:
+        # Create S3 client for MinIO
+        s3_client = boto3.client(
+            's3',
+            endpoint_url=f'http://{minio_endpoint}',
+            aws_access_key_id=minio_access_key,
+            aws_secret_access_key=minio_secret_key,
+            config=Config(signature_version='s3v4'),
+            region_name='us-east-1'
+        )
+        logger.info("✓ Successfully connected to MinIO")
+        
+        # Upload object key (path in bucket)
+        object_key = f"processed_data/{filename}"
+        
+        # Upload the file
+        logger.info(f"Uploading {filename} to MinIO bucket '{bucket_name}'...")
+        
+        s3_client.upload_file(
+            processed_filepath,
+            bucket_name,
+            object_key,
+            ExtraArgs={'ContentType': 'text/csv'}
+        )
+        
+        # Generate the S3 URL
+        s3_url = f"s3://{bucket_name}/{object_key}"
+        http_url = f"http://localhost:9000/{bucket_name}/{object_key}"
+        
+        logger.info(f"✓ File uploaded successfully!")
+        logger.info(f"  Bucket: {bucket_name}")
+        logger.info(f"  Object Key: {object_key}")
+        logger.info(f"  S3 URL: {s3_url}")
+        logger.info(f"  HTTP URL: {http_url}")
+        
+        storage_result['success'] = True
+        storage_result['storage_path'] = s3_url
+        storage_result['object_key'] = object_key
+        storage_result['http_url'] = http_url
+        
+        # Also keep a local backup copy
+        local_storage_dir = os.path.join(BASE_DIR, 'storage', 'processed_data')
+        os.makedirs(local_storage_dir, exist_ok=True)
+        local_path = os.path.join(local_storage_dir, filename)
+        shutil.copy2(processed_filepath, local_path)
+        storage_result['local_backup'] = local_path
+        logger.info(f"✓ Local backup saved: {local_path}")
+        
+    except Exception as e:
+        logger.error(f"✗ MinIO upload failed: {str(e)}")
+        logger.info("Falling back to local storage...")
+        
+        # Fallback to local storage
+        local_storage_dir = os.path.join(BASE_DIR, 'storage', 'processed_data')
+        os.makedirs(local_storage_dir, exist_ok=True)
+        local_path = os.path.join(local_storage_dir, filename)
+        shutil.copy2(processed_filepath, local_path)
+        
+        storage_result['storage_type'] = 'local_fallback'
+        storage_result['storage_path'] = local_path
+        storage_result['success'] = True
+        storage_result['error'] = str(e)
+        logger.info(f"✓ File saved to local storage: {local_path}")
     
     logger.info("=" * 60)
     logger.info("✓ STORAGE UPLOAD COMPLETE")
@@ -466,59 +534,144 @@ def storage_upload_task(**context):
 
 
 # ============================================================================
-# TASK 6: DVC VERSIONING (Step 3)
+# TASK 6: DVC VERSIONING (Step 3) - Version data with DVC, push to MinIO
 # ============================================================================
 def dvc_versioning_task(**context):
     """
-    Version processed data with DVC.
-    Creates .dvc metadata file for Git tracking.
+    Version processed data using DVC-compatible approach.
+    - Creates .dvc metadata file (MD5 hash based) 
+    - Pushes large dataset to MinIO remote storage (dvc-storage folder)
+    - Uses boto3 for MinIO storage (no DVC CLI dependency)
     """
-    import subprocess
+    import hashlib
+    import yaml
+    import boto3
+    from botocore.client import Config
     
     logger.info("=" * 60)
     logger.info("STARTING DVC VERSIONING")
     logger.info("=" * 60)
     
-    # Get storage result
+    # Get storage result - use local backup for DVC tracking
     ti = context['ti']
     storage_result = ti.xcom_pull(task_ids='storage_upload')
-    storage_path = storage_result['storage_path']
     
-    if not storage_path or not os.path.exists(storage_path):
-        raise FileNotFoundError(f"Storage file not found: {storage_path}")
+    # Use the local backup file for DVC (not S3 URL)
+    local_file = storage_result.get('local_backup') or storage_result.get('storage_path')
+    
+    # If storage_path is an S3 URL, we need to use local backup
+    if local_file and local_file.startswith('s3://'):
+        local_file = storage_result.get('local_backup')
+    
+    logger.info(f"File to track: {local_file}")
     
     dvc_result = {
-        'file': storage_path,
+        'file': local_file,
         'dvc_success': False,
+        'dvc_file': None,
+        'remote_push': False,
         'message': ''
     }
     
+    # Check if local file exists
+    if not local_file or not os.path.exists(local_file):
+        logger.warning(f"Local file not found: {local_file}")
+        dvc_result['message'] = f"Local file not found: {local_file}"
+        logger.info("=" * 60)
+        logger.info("✓ DVC VERSIONING STEP COMPLETE (skipped - no local file)")
+        logger.info("=" * 60)
+        return dvc_result
+    
+    # MinIO configuration for DVC remote
+    minio_endpoint = os.environ.get('MINIO_ENDPOINT', 'minio:9000')
+    minio_access_key = os.environ.get('MINIO_ACCESS_KEY', 'minioadmin')
+    minio_secret_key = os.environ.get('MINIO_SECRET_KEY', 'minioadmin')
+    bucket_name = os.environ.get('MINIO_BUCKET', 'mlops-data')
+    
+    # DVC metadata directory - save to mounted data folder for Git commit
+    dvc_meta_dir = os.path.join(BASE_DIR, 'data', 'dvc_files')
+    os.makedirs(dvc_meta_dir, exist_ok=True)
+    
     try:
-        # Initialize DVC if needed
-        dvc_dir = os.path.join(BASE_DIR, '.dvc')
-        if not os.path.exists(dvc_dir):
-            subprocess.run(['dvc', 'init', '-f'], cwd=BASE_DIR, capture_output=True)
-            logger.info("✓ DVC initialized")
+        filename = os.path.basename(local_file)
         
-        # Add file to DVC
-        result = subprocess.run(
-            ['dvc', 'add', storage_path],
-            cwd=BASE_DIR,
-            capture_output=True,
-            text=True
+        # Step 1: Calculate MD5 hash (DVC uses this as cache key)
+        logger.info("Calculating file MD5 hash...")
+        md5_hash = hashlib.md5()
+        file_size = 0
+        with open(local_file, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                md5_hash.update(chunk)
+                file_size += len(chunk)
+        
+        file_md5 = md5_hash.hexdigest()
+        logger.info(f"✓ File MD5: {file_md5}")
+        logger.info(f"✓ File size: {file_size} bytes")
+        
+        # Step 2: Create .dvc metadata file (YAML format, DVC-compatible)
+        # DVC stores files as: cache_dir/md5[0:2]/md5[2:]
+        dvc_cache_path = f"{file_md5[:2]}/{file_md5[2:]}"
+        
+        dvc_metadata = {
+            'outs': [{
+                'md5': file_md5,
+                'size': file_size,
+                'path': filename
+            }]
+        }
+        
+        dvc_file_path = os.path.join(dvc_meta_dir, f"{filename}.dvc")
+        with open(dvc_file_path, 'w') as f:
+            yaml.dump(dvc_metadata, f, default_flow_style=False)
+        
+        logger.info(f"✓ Created .dvc metadata file: {dvc_file_path}")
+        dvc_result['dvc_file'] = dvc_file_path
+        dvc_result['dvc_success'] = True
+        
+        # Step 3: Push file to MinIO dvc-storage (using DVC cache structure)
+        logger.info("Pushing data to MinIO dvc-storage...")
+        
+        s3_client = boto3.client(
+            's3',
+            endpoint_url=f'http://{minio_endpoint}',
+            aws_access_key_id=minio_access_key,
+            aws_secret_access_key=minio_secret_key,
+            config=Config(signature_version='s3v4'),
+            region_name='us-east-1'
         )
         
-        if result.returncode == 0:
-            dvc_result['dvc_success'] = True
-            dvc_result['message'] = 'File added to DVC tracking'
-            logger.info(f"✓ File added to DVC: {storage_path}")
-        else:
-            dvc_result['message'] = f"DVC add failed: {result.stderr}"
-            logger.warning(f"DVC add warning: {result.stderr}")
+        # Upload to dvc-storage with DVC cache structure: dvc-storage/md5[0:2]/md5[2:]
+        dvc_storage_key = f"dvc-storage/{dvc_cache_path}"
+        
+        s3_client.upload_file(
+            local_file,
+            bucket_name,
+            dvc_storage_key
+        )
+        
+        remote_path = f"s3://{bucket_name}/{dvc_storage_key}"
+        logger.info(f"✓ Data pushed to remote: {remote_path}")
+        dvc_result['remote_push'] = True
+        dvc_result['remote_path'] = remote_path
+        
+        # Step 4: Create .dvc config file (for reference)
+        dvc_config_content = f"""[core]
+    remote = minio
+['remote "minio"']
+    url = s3://{bucket_name}/dvc-storage
+    endpointurl = http://{minio_endpoint}
+    access_key_id = {minio_access_key}
+    secret_access_key = {minio_secret_key}
+"""
+        dvc_config_path = os.path.join(dvc_meta_dir, 'config')
+        with open(dvc_config_path, 'w') as f:
+            f.write(dvc_config_content)
+        logger.info(f"✓ DVC config saved: {dvc_config_path}")
+        
+        dvc_result['message'] = 'DVC versioning completed successfully'
+        dvc_result['md5'] = file_md5
+        dvc_result['cache_path'] = dvc_cache_path
             
-    except FileNotFoundError:
-        dvc_result['message'] = 'DVC not installed in container'
-        logger.warning("DVC not available - skipping versioning")
     except Exception as e:
         dvc_result['message'] = str(e)
         logger.warning(f"DVC versioning failed: {e}")

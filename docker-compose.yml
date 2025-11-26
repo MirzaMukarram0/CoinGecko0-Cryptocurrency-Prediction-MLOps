@@ -14,13 +14,16 @@ x-airflow-common:
     PYTHONPATH: /opt/airflow
     # CoinGecko API - loaded from .env file
     COINGECKO_API_KEY: ${COINGECKO_API_KEY}
+    # MinIO S3-compatible Storage
+    MINIO_ENDPOINT: minio:9000
+    MINIO_ACCESS_KEY: minioadmin
+    MINIO_SECRET_KEY: minioadmin
+    MINIO_BUCKET: mlops-data
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - airflow_logs:/opt/airflow/logs
     - ./data:/opt/airflow/data
     - ./src:/opt/airflow/src
-    - ./storage:/opt/airflow/storage
-    - ./dvc_storage:/opt/airflow/dvc_storage
 
 services:
   postgres:
@@ -40,6 +43,40 @@ services:
       retries: 5
     restart: always
 
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set myminio http://minio:9000 minioadmin minioadmin;
+      mc mb myminio/mlops-data --ignore-existing;
+      mc anonymous set download myminio/mlops-data;
+      echo 'MinIO bucket created successfully!';
+      "
+    restart: "no"
+
   airflow-init:
     <<: *airflow-common
     container_name: airflow-init
@@ -48,14 +85,15 @@ services:
     command:
       - -c
       - |
-        mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/data/raw /opt/airflow/data/processed /opt/airflow/data/profiles /opt/airflow/storage/processed_data /opt/airflow/dvc_storage
-        pip install --quiet requests pandas numpy dvc
+        mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/data/raw /opt/airflow/data/processed /opt/airflow/data/profiles /opt/airflow/storage/processed_data
+        pip install --quiet requests pandas numpy boto3
         airflow db init
         airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com || true
         echo "============================================"
         echo "Airflow initialization complete!"
         echo "Username: admin | Password: admin"
         echo "URL: http://localhost:8080"
+        echo "MinIO Console: http://localhost:9001"
         echo "============================================"
     depends_on:
       postgres:
@@ -82,17 +120,23 @@ services:
   airflow-scheduler:
     <<: *airflow-common
     container_name: airflow-scheduler
+    user: root
     entrypoint: /bin/bash
     command:
       - -c
       - |
-        pip install --quiet dvc
-        exec airflow scheduler
+        pip install --quiet boto3 pyyaml
+        mkdir -p /opt/airflow/data/dvc_files
+        chown -R 50000:0 /opt/airflow/data/dvc_files
+        exec gosu airflow airflow scheduler
     depends_on:
       airflow-init:
+        condition: service_completed_successfully
+      minio-init:
         condition: service_completed_successfully
     restart: always
 
 volumes:
   postgres_data:
   airflow_logs:
+  minio_data:

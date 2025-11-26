@@ -42,13 +42,18 @@ coverage.xml
 cover/
 
 # Virtual environments
-.env
+venv/
 .venv
 env/
-venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Environment variables - KEEP .env for config template, ignore local overrides
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 
 # MLOps specific
 # MLflow
@@ -62,12 +67,18 @@ mlflow-server.db
 .dvc/tmp/
 .dvc/.dvc/lock
 
-# Data directories
+# Data directories - raw/processed are generated, but dvc_files should be tracked
 data/raw/
 data/processed/
+data/profiles/
 data/cloud_storage/
 data/dvc_storage/
 reports/
+
+# Keep DVC metadata files (small files to commit)
+!data/dvc_files/
+!data/dvc_files/*.dvc
+!data/dvc_files/config
 
 # Airflow
 airflow/logs/
@@ -122,6 +133,7 @@ credentials/
 *.pem
 *.key
 .secrets/
+google_credentials*.json
 
 # Cloud provider credentials
 .aws/

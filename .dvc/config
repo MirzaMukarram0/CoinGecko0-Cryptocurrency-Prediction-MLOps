@@ -1,6 +1,0 @@
-[core]
-    remote = local_storage
-['remote "local"']
-    url = C:\Users\ahmed\AppData\Local\Temp\phase1_test_akapz1eo\dvc_remote
-['remote "local_storage"']
-    url = ../dvc_storage
