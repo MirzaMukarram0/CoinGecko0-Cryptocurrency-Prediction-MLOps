@@ -684,7 +684,61 @@ def dvc_versioning_task(**context):
 
 
 # ============================================================================
-# TASK 7: PIPELINE SUMMARY
+# TASK 7: MODEL TRAINING WITH MLFLOW (Phase 2)
+# ============================================================================
+def train_model_task(**context):
+    """
+    Train cryptocurrency price prediction models with MLflow tracking.
+    Logs experiments to DagHub MLflow server.
+    
+    Models trained:
+    - Random Forest
+    - Gradient Boosting
+    - Ridge Regression
+    
+    Metrics tracked:
+    - RMSE, MAE, R², MAPE
+    - Cross-validation scores
+    - Training time
+    """
+    import sys
+    sys.path.insert(0, '/opt/airflow')
+    
+    from src.models.train import train_with_mlflow
+    
+    logger.info("=" * 60)
+    logger.info("STARTING MODEL TRAINING WITH MLFLOW")
+    logger.info("=" * 60)
+    
+    # Get processed filepath from profiling task
+    ti = context['ti']
+    profiling_result = ti.xcom_pull(task_ids='data_profiling')
+    processed_filepath = profiling_result.get('processed_filepath')
+    
+    if not processed_filepath:
+        raise ValueError("No processed data filepath found from profiling task")
+    
+    logger.info(f"Training on data: {processed_filepath}")
+    
+    # Train models with MLflow tracking
+    results = train_with_mlflow(data_path=processed_filepath)
+    
+    logger.info("=" * 60)
+    logger.info("✓ MODEL TRAINING COMPLETE")
+    logger.info(f"   Best Model: {results.get('best_model')}")
+    logger.info(f"   Best RMSE: {results.get('best_rmse', 'N/A')}")
+    logger.info("=" * 60)
+    
+    return {
+        'best_model': results.get('best_model'),
+        'best_rmse': results.get('best_rmse'),
+        'models_trained': list(results.get('results', {}).keys()),
+        'processed_filepath': processed_filepath
+    }
+
+
+# ============================================================================
+# TASK 8: PIPELINE SUMMARY
 # ============================================================================
 def pipeline_summary_task(**context):
     """Generate final pipeline execution summary."""
@@ -700,6 +754,7 @@ def pipeline_summary_task(**context):
     profiling_result = ti.xcom_pull(task_ids='data_profiling')
     storage_result = ti.xcom_pull(task_ids='storage_upload')
     dvc_result = ti.xcom_pull(task_ids='dvc_versioning')
+    training_result = ti.xcom_pull(task_ids='train_model')
     
     summary = {
         'execution_time': datetime.now().isoformat(),
@@ -718,6 +773,11 @@ def pipeline_summary_task(**context):
         },
         'versioning': {
             'dvc_tracked': dvc_result.get('dvc_success', False)
+        },
+        'training': {
+            'completed': training_result is not None,
+            'best_model': training_result.get('best_model') if training_result else None,
+            'best_rmse': training_result.get('best_rmse') if training_result else None
         }
     }
     
@@ -726,6 +786,10 @@ def pipeline_summary_task(**context):
     logger.info(f"   Features: {summary['transformation']['features_count']}")
     logger.info(f"   Storage: {summary['storage']['uploaded']}")
     logger.info(f"   DVC: {summary['versioning']['dvc_tracked']}")
+    logger.info(f"   Training: {summary['training']['completed']}")
+    if summary['training']['best_model']:
+        logger.info(f"   Best Model: {summary['training']['best_model']}")
+        logger.info(f"   Best RMSE: {summary['training']['best_rmse']:.4f}")
     logger.info("=" * 60)
     
     return summary
@@ -737,10 +801,10 @@ def pipeline_summary_task(**context):
 with DAG(
     'cryptocurrency_mlops_pipeline',
     default_args=default_args,
-    description='Complete cryptocurrency MLOps pipeline: Extract → Quality Gate → Transform → Profile → Store → Version',
+    description='Complete cryptocurrency MLOps pipeline: Extract → Quality Gate → Transform → Profile → Store → Version → Train',
     schedule_interval='0 */6 * * *',  # Every 6 hours
     catchup=False,
-    tags=['cryptocurrency', 'mlops', 'etl', 'data-pipeline'],
+    tags=['cryptocurrency', 'mlops', 'etl', 'data-pipeline', 'mlflow'],
 ) as dag:
     
     # Task definitions
@@ -774,14 +838,19 @@ with DAG(
         python_callable=dvc_versioning_task,
     )
     
+    train_model = PythonOperator(
+        task_id='train_model',
+        python_callable=train_model_task,
+    )
+    
     pipeline_summary = PythonOperator(
         task_id='pipeline_summary',
         python_callable=pipeline_summary_task,
     )
     
     # Define task dependencies (DAG structure)
-    # Extract → Quality Check (mandatory gate) → Transform → Profile → Store → Version → Summary
-    extract_data >> data_quality_check >> transform_data >> data_profiling >> storage_upload >> dvc_versioning >> pipeline_summary
+    # Extract → Quality Check → Transform → Profile → Store → Version → Train → Summary
+    extract_data >> data_quality_check >> transform_data >> data_profiling >> storage_upload >> dvc_versioning >> train_model >> pipeline_summary
 
 
 # DAG documentation
@@ -789,8 +858,8 @@ dag.doc_md = """
 # Cryptocurrency MLOps Pipeline
 
 ## Overview
-Complete ETL pipeline for cryptocurrency price data with automated quality checks,
-feature engineering, and data versioning.
+Complete MLOps pipeline for cryptocurrency price prediction with automated quality checks,
+feature engineering, data versioning, and model training with MLflow tracking.
 
 ## Pipeline Steps
 
@@ -815,14 +884,29 @@ feature engineering, and data versioning.
 - Logs to MLflow/Dagshub as artifact
 
 ### 5. Storage Upload (Step 2.3)
-- Uploads processed data to object storage
+- Uploads processed data to MinIO object storage
 
 ### 6. DVC Versioning (Step 3)
 - Versions dataset with DVC
 - Creates .dvc metadata file for Git
+- Pushes data to MinIO remote
+
+### 7. Model Training (Phase 2)
+- Trains multiple models: RandomForest, GradientBoosting, Ridge
+- MLflow tracking to DagHub server
+- Logs hyperparameters, metrics (RMSE, MAE, R², MAPE)
+- Registers models in MLflow Model Registry
+- Creates feature importance and prediction plots
+
+### 8. Pipeline Summary
+- Aggregates results from all tasks
+- Reports best model and metrics
 
 ## Schedule
 Runs every 6 hours: `0 */6 * * *`
+
+## MLflow Dashboard
+View experiments at: https://dagshub.com/MirzaMukarram0/CoinGecko0-Cryptocurrency-Prediction-MLOps.mlflow/
 
 ## Monitoring
 View execution logs in Airflow UI for each task.

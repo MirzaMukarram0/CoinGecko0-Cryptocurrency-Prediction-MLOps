@@ -1,0 +1,4 @@
+[core]
+    remote = dagshub_storage
+['remote "dagshub_storage"']
+    url = https://dagshub.com/MirzaMukarram0/CoinGecko0-Cryptocurrency-Prediction-MLOps.dvc
