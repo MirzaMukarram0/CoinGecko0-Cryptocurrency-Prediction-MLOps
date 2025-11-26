@@ -1,0 +1,168 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# MLOps specific
+# MLflow
+mlruns/
+mlartifacts/
+.mlflow/
+mlflow-server.db
+
+# DVC
+.dvc/cache/
+.dvc/tmp/
+.dvc/.dvc/lock
+
+# Data directories
+data/raw/
+data/processed/
+data/cloud_storage/
+data/dvc_storage/
+reports/
+
+# Airflow
+airflow/logs/
+airflow/plugins/
+airflow_home/
+dags/__pycache__/
+airflow-webserver.pid
+
+# Docker
+.dockerignore
+
+# Jupyter
+.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Operating System
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Environment variables
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Database
+*.db
+*.sqlite3
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+
+# Secrets and credentials
+secrets/
+credentials/
+*.pem
+*.key
+.secrets/
+
+# Cloud provider credentials
+.aws/
+.azure/
+gcp-key.json
+
+# MinIO/S3 data
+minio-data/
+
+# PostgreSQL data
+postgres-data/
+
+# Model artifacts (if not tracked by DVC)
+models/
+artifacts/
+
+# Configuration files with sensitive data
+config/local/
+config/secrets/
+**/config/local.py
+**/config/secrets.py
+
+# Large files (should use DVC instead)
+*.parquet
+*.csv
+!**/sample.csv
+!**/test.csv
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# Testing
+.coverage
+.pytest_cache/
+
+# Documentation builds
+docs/_build/
+site/

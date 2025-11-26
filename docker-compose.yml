@@ -1,0 +1,98 @@
+x-airflow-common:
+  &airflow-common
+  image: apache/airflow:2.6.3-python3.11
+  env_file:
+    - .env
+  environment:
+    &airflow-common-env
+    AIRFLOW_HOME: /opt/airflow
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+    PYTHONPATH: /opt/airflow
+    # CoinGecko API - loaded from .env file
+    COINGECKO_API_KEY: ${COINGECKO_API_KEY}
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - airflow_logs:/opt/airflow/logs
+    - ./data:/opt/airflow/data
+    - ./src:/opt/airflow/src
+    - ./storage:/opt/airflow/storage
+    - ./dvc_storage:/opt/airflow/dvc_storage
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+    restart: always
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    user: "50000:0"
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/data/raw /opt/airflow/data/processed /opt/airflow/data/profiles /opt/airflow/storage/processed_data /opt/airflow/dvc_storage
+        pip install --quiet requests pandas numpy dvc
+        airflow db init
+        airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com || true
+        echo "============================================"
+        echo "Airflow initialization complete!"
+        echo "Username: admin | Password: admin"
+        echo "URL: http://localhost:8080"
+        echo "============================================"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        pip install --quiet dvc
+        exec airflow scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: always
+
+volumes:
+  postgres_data:
+  airflow_logs:
