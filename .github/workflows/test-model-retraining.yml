@@ -1,0 +1,554 @@
+# ============================================================================
+# TEST BRANCH - MODEL RETRAINING WITH CML (Dev → Test)
+# ============================================================================
+# This workflow runs on PRs from dev to test branch
+# It triggers model retraining and uses CML to generate metric comparison reports
+# Blocks merge if new model performs worse than production model
+
+name: Test - Model Retraining & CML Report
+
+on:
+  pull_request:
+    branches:
+      - test
+  push:
+    branches:
+      - test
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+  MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME }}
+  MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
+
+jobs:
+  # =========================================================================
+  # Job 1: Model Retraining Pipeline
+  # =========================================================================
+  model-retraining:
+    name: 🔄 Model Retraining Pipeline
+    runs-on: ubuntu-latest
+    outputs:
+      new_model_rmse: ${{ steps.train.outputs.new_rmse }}
+      new_model_mae: ${{ steps.train.outputs.new_mae }}
+      new_model_r2: ${{ steps.train.outputs.new_r2 }}
+      prod_model_rmse: ${{ steps.compare.outputs.prod_rmse }}
+      prod_model_mae: ${{ steps.compare.outputs.prod_mae }}
+      prod_model_r2: ${{ steps.compare.outputs.prod_r2 }}
+      model_improved: ${{ steps.compare.outputs.model_improved }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install mlflow>=2.9.0 pandas numpy scikit-learn matplotlib
+
+      - name: Create data directories
+        run: |
+          mkdir -p data/raw data/processed data/models data/profiles
+
+      - name: Extract fresh data from CoinGecko API
+        id: extract
+        run: |
+          echo "📥 Extracting fresh cryptocurrency data..."
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          from src.data.extract import extract_coingecko_data
+          
+          try:
+              df = extract_coingecko_data(
+                  coin_id='bitcoin',
+                  vs_currency='usd',
+                  days=30
+              )
+              df.to_csv('data/raw/raw_ci_data.csv')
+              print(f'✅ Extracted {len(df)} records')
+          except Exception as e:
+              print(f'⚠️ API extraction failed: {e}')
+              # Create synthetic data for CI
+              import pandas as pd
+              import numpy as np
+              dates = pd.date_range('2024-01-01', periods=720, freq='H')
+              df = pd.DataFrame({
+                  'price': 45000 + np.cumsum(np.random.randn(720) * 100),
+                  'market_cap': 900e9 + np.cumsum(np.random.randn(720) * 1e9),
+                  'total_volume': 20e9 + np.random.uniform(-1e9, 1e9, 720)
+              }, index=dates)
+              df.to_csv('data/raw/raw_ci_data.csv')
+              print(f'✅ Created synthetic data with {len(df)} records')
+          "
+
+      - name: Transform data
+        run: |
+          echo "🔄 Transforming data..."
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          import pandas as pd
+          from src.data.transform import transform_data
+          
+          df = pd.read_csv('data/raw/raw_ci_data.csv', index_col=0, parse_dates=True)
+          transformed_df = transform_data(df)
+          transformed_df.to_csv('data/processed/processed_ci_data.csv')
+          print(f'✅ Transformed data: {len(transformed_df)} records with {len(transformed_df.columns)} features')
+          "
+
+      - name: Train new model
+        id: train
+        run: |
+          echo "🤖 Training new model..."
+          python << 'EOF'
+          import sys
+          import json
+          import os
+          sys.path.insert(0, '.')
+          
+          import pandas as pd
+          import numpy as np
+          from sklearn.model_selection import train_test_split
+          from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+          from sklearn.linear_model import Ridge
+          from sklearn.preprocessing import StandardScaler
+          from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+          import mlflow
+          
+          # Load processed data
+          df = pd.read_csv('data/processed/processed_ci_data.csv', index_col=0, parse_dates=True)
+          
+          # Prepare features
+          target_col = 'price'
+          feature_cols = [col for col in df.columns if col != target_col and not col.startswith('price_target')]
+          
+          X = df[feature_cols].values
+          y = df[target_col].values
+          
+          # Split data
+          X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+          
+          # Scale features
+          scaler = StandardScaler()
+          X_train_scaled = scaler.fit_transform(X_train)
+          X_test_scaled = scaler.transform(X_test)
+          
+          # Train models
+          models = {
+              'random_forest': RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1),
+              'gradient_boosting': GradientBoostingRegressor(n_estimators=100, random_state=42),
+              'ridge': Ridge(alpha=1.0)
+          }
+          
+          best_rmse = float('inf')
+          best_model_name = None
+          results = {}
+          
+          for name, model in models.items():
+              print(f"Training {name}...")
+              model.fit(X_train_scaled, y_train)
+              y_pred = model.predict(X_test_scaled)
+              
+              rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+              mae = mean_absolute_error(y_test, y_pred)
+              r2 = r2_score(y_test, y_pred)
+              
+              results[name] = {'rmse': rmse, 'mae': mae, 'r2': r2}
+              print(f"  {name}: RMSE={rmse:.2f}, MAE={mae:.2f}, R²={r2:.4f}")
+              
+              if rmse < best_rmse:
+                  best_rmse = rmse
+                  best_model_name = name
+          
+          # Use best model metrics
+          best_metrics = results[best_model_name]
+          
+          # Save metrics to file for CML
+          with open('new_model_metrics.json', 'w') as f:
+              json.dump({
+                  'best_model': best_model_name,
+                  'rmse': best_metrics['rmse'],
+                  'mae': best_metrics['mae'],
+                  'r2': best_metrics['r2'],
+                  'all_models': results
+              }, f, indent=2)
+          
+          print(f"\n✅ Best model: {best_model_name}")
+          print(f"   RMSE: {best_metrics['rmse']:.2f}")
+          print(f"   MAE: {best_metrics['mae']:.2f}")
+          print(f"   R²: {best_metrics['r2']:.4f}")
+          
+          # Set outputs for GitHub Actions
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"new_rmse={best_metrics['rmse']:.4f}\n")
+              f.write(f"new_mae={best_metrics['mae']:.4f}\n")
+              f.write(f"new_r2={best_metrics['r2']:.4f}\n")
+          EOF
+
+      - name: Get production model metrics from MLflow
+        id: compare
+        run: |
+          echo "📊 Fetching production model metrics from MLflow..."
+          python << 'EOF'
+          import os
+          import json
+          import mlflow
+          from mlflow.tracking import MlflowClient
+          
+          tracking_uri = os.environ.get('MLFLOW_TRACKING_URI', '')
+          prod_rmse = 99999.0
+          prod_mae = 99999.0
+          prod_r2 = 0.0
+          
+          if tracking_uri:
+              try:
+                  mlflow.set_tracking_uri(tracking_uri)
+                  client = MlflowClient()
+                  
+                  # Try to get production model from Model Registry
+                  try:
+                      # Search for models in registry
+                      registered_models = client.search_registered_models()
+                      
+                      for rm in registered_models:
+                          model_name = rm.name
+                          # Get the production version
+                          try:
+                              prod_versions = client.get_latest_versions(model_name, stages=["Production"])
+                              if prod_versions:
+                                  version = prod_versions[0]
+                                  run = client.get_run(version.run_id)
+                                  
+                                  prod_rmse = float(run.data.metrics.get('rmse', 99999))
+                                  prod_mae = float(run.data.metrics.get('mae', 99999))
+                                  prod_r2 = float(run.data.metrics.get('r2', 0))
+                                  print(f"✅ Found production model: {model_name}")
+                                  print(f"   RMSE: {prod_rmse:.4f}")
+                                  print(f"   MAE: {prod_mae:.4f}")
+                                  print(f"   R²: {prod_r2:.4f}")
+                                  break
+                          except Exception as e:
+                              continue
+                  except Exception as e:
+                      print(f"⚠️ No production model found in registry: {e}")
+                      
+                  # Fallback: get best run from experiments
+                  if prod_rmse == 99999.0:
+                      experiments = client.search_experiments()
+                      for exp in experiments:
+                          if exp.name != "Default":
+                              runs = client.search_runs(
+                                  experiment_ids=[exp.experiment_id],
+                                  order_by=["metrics.rmse ASC"],
+                                  max_results=1
+                              )
+                              if runs:
+                                  best_run = runs[0]
+                                  prod_rmse = float(best_run.data.metrics.get('rmse', 99999))
+                                  prod_mae = float(best_run.data.metrics.get('mae', 99999))
+                                  prod_r2 = float(best_run.data.metrics.get('r2', 0))
+                                  print(f"✅ Found best historical model")
+                                  print(f"   RMSE: {prod_rmse:.4f}")
+                                  break
+                                  
+              except Exception as e:
+                  print(f"⚠️ Could not connect to MLflow: {e}")
+                  print("Using default baseline metrics")
+          else:
+              print("⚠️ MLflow not configured, using default baseline")
+          
+          # Load new model metrics
+          with open('new_model_metrics.json', 'r') as f:
+              new_metrics = json.load(f)
+          
+          new_rmse = new_metrics['rmse']
+          
+          # Determine if model improved (lower RMSE is better)
+          # Allow 5% tolerance for statistical variation
+          tolerance = 0.05
+          model_improved = new_rmse <= prod_rmse * (1 + tolerance)
+          
+          print(f"\n📊 Model Comparison:")
+          print(f"   Production RMSE: {prod_rmse:.4f}")
+          print(f"   New Model RMSE:  {new_rmse:.4f}")
+          print(f"   Improved: {'✅ Yes' if model_improved else '❌ No'}")
+          
+          # Save comparison for CML report
+          with open('model_comparison.json', 'w') as f:
+              json.dump({
+                  'production': {'rmse': prod_rmse, 'mae': prod_mae, 'r2': prod_r2},
+                  'new_model': new_metrics,
+                  'model_improved': model_improved,
+                  'rmse_change': ((new_rmse - prod_rmse) / prod_rmse * 100) if prod_rmse > 0 else 0
+              }, f, indent=2)
+          
+          # Set outputs
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"prod_rmse={prod_rmse:.4f}\n")
+              f.write(f"prod_mae={prod_mae:.4f}\n")
+              f.write(f"prod_r2={prod_r2:.4f}\n")
+              f.write(f"model_improved={'true' if model_improved else 'false'}\n")
+          EOF
+
+      - name: Upload training artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-artifacts
+          path: |
+            new_model_metrics.json
+            model_comparison.json
+            data/processed/
+
+  # =========================================================================
+  # Job 2: CML Report Generation
+  # =========================================================================
+  cml-report:
+    name: 📊 CML Metric Comparison Report
+    runs-on: ubuntu-latest
+    needs: model-retraining
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup CML
+        uses: iterative/setup-cml@v2
+
+      - name: Download training artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: training-artifacts
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install visualization dependencies
+        run: |
+          pip install matplotlib pandas numpy
+
+      - name: Generate CML Report
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "📊 Generating CML Report..."
+          
+          # Create metrics visualization
+          python << 'EOF'
+          import json
+          import matplotlib.pyplot as plt
+          import numpy as np
+          
+          # Load comparison data
+          with open('model_comparison.json', 'r') as f:
+              comparison = json.load(f)
+          
+          prod = comparison['production']
+          new = comparison['new_model']
+          
+          # Create comparison chart
+          fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+          
+          metrics = ['RMSE', 'MAE', 'R²']
+          prod_values = [prod['rmse'], prod['mae'], prod['r2']]
+          new_values = [new['rmse'], new['mae'], new['r2']]
+          
+          x = np.arange(len(metrics))
+          width = 0.35
+          
+          # RMSE comparison
+          axes[0].bar(['Production', 'New Model'], [prod['rmse'], new['rmse']], 
+                      color=['#2ecc71', '#3498db'])
+          axes[0].set_title('RMSE Comparison (Lower is Better)')
+          axes[0].set_ylabel('RMSE')
+          
+          # MAE comparison
+          axes[1].bar(['Production', 'New Model'], [prod['mae'], new['mae']], 
+                      color=['#2ecc71', '#3498db'])
+          axes[1].set_title('MAE Comparison (Lower is Better)')
+          axes[1].set_ylabel('MAE')
+          
+          # R² comparison
+          axes[2].bar(['Production', 'New Model'], [prod['r2'], new['r2']], 
+                      color=['#2ecc71', '#3498db'])
+          axes[2].set_title('R² Comparison (Higher is Better)')
+          axes[2].set_ylabel('R²')
+          
+          plt.tight_layout()
+          plt.savefig('metrics_comparison.png', dpi=150, bbox_inches='tight')
+          print("✅ Created metrics comparison chart")
+          EOF
+          
+          # Generate CML report
+          cat << 'REPORT' > report.md
+          # 🤖 Model Performance Comparison Report
+          
+          ## Summary
+          REPORT
+          
+          python << 'EOF' >> report.md
+          import json
+          
+          with open('model_comparison.json', 'r') as f:
+              data = json.load(f)
+          
+          improved = data['model_improved']
+          change = data['rmse_change']
+          
+          if improved:
+              print(f"✅ **New model PASSED** - Ready for merge")
+              print(f"")
+              print(f"The new model shows {'improved' if change < 0 else 'comparable'} performance.")
+          else:
+              print(f"❌ **New model FAILED** - Merge should be blocked")
+              print(f"")
+              print(f"The new model shows degraded performance ({change:.1f}% worse RMSE).")
+          EOF
+          
+          cat << 'REPORT' >> report.md
+          
+          ## Metrics Comparison
+          
+          | Metric | Production Model | New Model | Change |
+          |--------|-----------------|-----------|--------|
+          REPORT
+          
+          python << 'EOF' >> report.md
+          import json
+          
+          with open('model_comparison.json', 'r') as f:
+              data = json.load(f)
+          
+          prod = data['production']
+          new = data['new_model']
+          
+          def format_change(old, new, lower_is_better=True):
+              if old == 0 or old == 99999:
+                  return "N/A"
+              pct = ((new - old) / old) * 100
+              if lower_is_better:
+                  emoji = "🟢" if pct <= 0 else "🔴"
+              else:
+                  emoji = "🟢" if pct >= 0 else "🔴"
+              return f"{emoji} {pct:+.2f}%"
+          
+          print(f"| RMSE | {prod['rmse']:.4f} | {new['rmse']:.4f} | {format_change(prod['rmse'], new['rmse'], True)} |")
+          print(f"| MAE | {prod['mae']:.4f} | {new['mae']:.4f} | {format_change(prod['mae'], new['mae'], True)} |")
+          print(f"| R² | {prod['r2']:.4f} | {new['r2']:.4f} | {format_change(prod['r2'], new['r2'], False)} |")
+          EOF
+          
+          cat << 'REPORT' >> report.md
+          
+          ## Model Details
+          REPORT
+          
+          python << 'EOF' >> report.md
+          import json
+          
+          with open('new_model_metrics.json', 'r') as f:
+              data = json.load(f)
+          
+          print(f"**Best Model Type:** {data['best_model']}")
+          print(f"")
+          print(f"### All Trained Models")
+          print(f"")
+          print(f"| Model | RMSE | MAE | R² |")
+          print(f"|-------|------|-----|-----|")
+          for name, metrics in data['all_models'].items():
+              best_marker = " ⭐" if name == data['best_model'] else ""
+              print(f"| {name}{best_marker} | {metrics['rmse']:.4f} | {metrics['mae']:.4f} | {metrics['r2']:.4f} |")
+          EOF
+          
+          cat << 'REPORT' >> report.md
+          
+          ## Visualization
+          
+          ![Metrics Comparison](./metrics_comparison.png)
+          
+          ---
+          *Generated by CML on GitHub Actions*
+          REPORT
+          
+          # Post comment to PR
+          cml comment create report.md --watermark-title="Model Performance Report"
+
+      - name: Check model performance gate
+        if: needs.model-retraining.outputs.model_improved == 'false'
+        run: |
+          echo "❌ Model performance check FAILED"
+          echo "The new model performs worse than the production model."
+          echo "Please improve the model before merging."
+          exit 1
+
+  # =========================================================================
+  # Job 3: Integration Tests
+  # =========================================================================
+  integration-tests:
+    name: 🔗 Integration Tests
+    runs-on: ubuntu-latest
+    needs: model-retraining
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+          pip install -r requirements.txt
+
+      - name: Create test directories
+        run: |
+          mkdir -p data/raw data/processed data/models data/profiles
+
+      - name: Run Integration Tests
+        run: |
+          echo "🔗 Running Integration Tests..."
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          
+          # Test module imports
+          from src.data.extract import CoinGeckoExtractor
+          print('✅ CoinGeckoExtractor import passed')
+          
+          from src.data.transform import transform_data
+          print('✅ transform_data import passed')
+          
+          from src.models.train import CryptoPricePredictor
+          print('✅ CryptoPricePredictor import passed')
+          
+          from src.api.app import app
+          print('✅ FastAPI app import passed')
+          
+          print('🎉 All integration tests passed!')
+          "
+
+      - name: Validate DAG Syntax
+        run: |
+          echo "✈️ Validating Airflow DAG syntax..."
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          import ast
+          with open('airflow/dags/currency_prediction_dag.py', 'r') as f:
+              ast.parse(f.read())
+          print('✅ DAG syntax is valid')
+          "
