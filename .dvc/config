@@ -1,0 +1,6 @@
+[core]
+    remote = local
+['remote "dagshub_storage"']
+    url = https://dagshub.com/MirzaMukarram0/CoinGecko0-Cryptocurrency-Prediction-MLOps.dvc
+['remote "local"']
+    url = C:\Users\ahmed\AppData\Local\Temp\phase1_test_myuztic2\dvc_remote

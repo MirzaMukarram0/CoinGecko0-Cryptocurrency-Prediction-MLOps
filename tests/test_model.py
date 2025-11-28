@@ -14,7 +14,7 @@ from unittest.mock import patch, MagicMock
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from models.train import CryptoPricePredictor as TrainPredictor, train_prediction_model
+from models.train import CryptoPricePredictor as TrainPredictor, train_with_mlflow
 from models.predict import CryptoPricePredictor as PredictPredictor, make_predictions
 
 

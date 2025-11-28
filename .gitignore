@@ -66,7 +66,7 @@ mlflow-server.db
 # DVC
 .dvc/cache/
 .dvc/tmp/
-.dvc/.dvc/lock
+.dvc/lock
 
 # Data directories - raw/processed are generated, but dvc_files should be tracked
 data/raw/
@@ -80,6 +80,10 @@ reports/
 !data/dvc_files/
 !data/dvc_files/*.dvc
 !data/dvc_files/config
+
+# Keep model metadata (small JSON files)
+!data/models/*.json
+!data/models/*.csv
 
 # Airflow
 airflow/logs/
@@ -148,8 +152,8 @@ minio-data/
 postgres-data/
 
 # Model artifacts (if not tracked by DVC)
-models/
-artifacts/
+# Keep data/models for DVC tracking
+!data/models/
 
 # Configuration files with sensitive data
 config/local/

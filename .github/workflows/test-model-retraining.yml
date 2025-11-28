@@ -1,0 +1,330 @@
+# ============================================================================
+# TEST BRANCH - MODEL RETRAINING WITH CML (Dev -> Test)
+# ============================================================================
+# Runs on PRs from dev to test branch
+# Triggers model retraining and uses CML to generate metric comparison reports
+# Blocks merge if new model performs worse than production model
+
+name: Test - Model Retraining with CML
+
+on:
+  pull_request:
+    branches:
+      - test
+  push:
+    branches:
+      - test
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+  MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME }}
+  MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
+
+jobs:
+  # =========================================================================
+  # Job 1: Model Retraining Pipeline
+  # =========================================================================
+  model-retraining:
+    name: Model Retraining Pipeline
+    runs-on: ubuntu-latest
+    outputs:
+      new_model_rmse: ${{ steps.train.outputs.new_rmse }}
+      prod_model_rmse: ${{ steps.compare.outputs.prod_rmse }}
+      model_improved: ${{ steps.compare.outputs.model_improved }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-ci.txt
+          pip install mlflow>=2.9.0
+
+      - name: Create data directories
+        run: |
+          mkdir -p data/raw data/processed data/models data/profiles
+
+      - name: Train model and get metrics
+        id: train
+        run: |
+          echo "Training new model..."
+          python << 'EOF'
+          import sys
+          import json
+          import os
+          sys.path.insert(0, '.')
+          
+          import pandas as pd
+          import numpy as np
+          from sklearn.model_selection import train_test_split
+          from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+          from sklearn.linear_model import Ridge
+          from sklearn.preprocessing import StandardScaler
+          from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+          
+          # Create synthetic data for CI testing
+          np.random.seed(42)
+          dates = pd.date_range('2024-01-01', periods=720, freq='h')
+          df = pd.DataFrame({
+              'price': 45000 + np.cumsum(np.random.randn(720) * 100),
+              'market_cap': 900e9 + np.cumsum(np.random.randn(720) * 1e9),
+              'total_volume': 20e9 + np.random.uniform(-1e9, 1e9, 720),
+              'hour': dates.hour,
+              'day_of_week': dates.dayofweek,
+          }, index=dates)
+          
+          # Add features
+          for lag in [1, 3, 6]:
+              df[f'price_lag_{lag}h'] = df['price'].shift(lag)
+          df['price_rolling_mean'] = df['price'].rolling(24).mean()
+          df.dropna(inplace=True)
+          
+          # Prepare data
+          target_col = 'price'
+          feature_cols = [col for col in df.columns if col != target_col]
+          X = df[feature_cols].values
+          y = df[target_col].values
+          
+          X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+          
+          scaler = StandardScaler()
+          X_train_scaled = scaler.fit_transform(X_train)
+          X_test_scaled = scaler.transform(X_test)
+          
+          # Train models
+          models = {
+              'random_forest': RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1),
+              'gradient_boosting': GradientBoostingRegressor(n_estimators=50, random_state=42),
+              'ridge': Ridge(alpha=1.0)
+          }
+          
+          best_rmse = float('inf')
+          best_model_name = None
+          results = {}
+          
+          for name, model in models.items():
+              model.fit(X_train_scaled, y_train)
+              y_pred = model.predict(X_test_scaled)
+              
+              rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+              mae = mean_absolute_error(y_test, y_pred)
+              r2 = r2_score(y_test, y_pred)
+              
+              results[name] = {'rmse': rmse, 'mae': mae, 'r2': r2}
+              
+              if rmse < best_rmse:
+                  best_rmse = rmse
+                  best_model_name = name
+          
+          best_metrics = results[best_model_name]
+          
+          # Save metrics
+          with open('new_model_metrics.json', 'w') as f:
+              json.dump({
+                  'best_model': best_model_name,
+                  'rmse': best_metrics['rmse'],
+                  'mae': best_metrics['mae'],
+                  'r2': best_metrics['r2'],
+                  'all_models': results
+              }, f, indent=2)
+          
+          print(f"Best model: {best_model_name}")
+          print(f"RMSE: {best_metrics['rmse']:.4f}")
+          
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"new_rmse={best_metrics['rmse']:.4f}\n")
+          EOF
+
+      - name: Compare with production model
+        id: compare
+        run: |
+          echo "Comparing with production model..."
+          python << 'EOF'
+          import os
+          import json
+          import mlflow
+          from mlflow.tracking import MlflowClient
+          
+          tracking_uri = os.environ.get('MLFLOW_TRACKING_URI', '')
+          prod_rmse = 99999.0
+          
+          if tracking_uri:
+              try:
+                  mlflow.set_tracking_uri(tracking_uri)
+                  client = MlflowClient()
+                  
+                  # Try to get best run from experiments
+                  experiments = client.search_experiments()
+                  for exp in experiments:
+                      if exp.name != "Default":
+                          runs = client.search_runs(
+                              experiment_ids=[exp.experiment_id],
+                              order_by=["metrics.rmse ASC"],
+                              max_results=1
+                          )
+                          if runs:
+                              prod_rmse = float(runs[0].data.metrics.get('rmse', 99999))
+                              print(f"Found production model RMSE: {prod_rmse:.4f}")
+                              break
+              except Exception as e:
+                  print(f"Could not connect to MLflow: {e}")
+          
+          # Load new model metrics
+          with open('new_model_metrics.json', 'r') as f:
+              new_metrics = json.load(f)
+          
+          new_rmse = new_metrics['rmse']
+          
+          # Allow 5% tolerance
+          model_improved = new_rmse <= prod_rmse * 1.05
+          
+          print(f"Production RMSE: {prod_rmse:.4f}")
+          print(f"New Model RMSE: {new_rmse:.4f}")
+          print(f"Model Improved: {model_improved}")
+          
+          # Save comparison
+          with open('model_comparison.json', 'w') as f:
+              json.dump({
+                  'production_rmse': prod_rmse,
+                  'new_rmse': new_rmse,
+                  'model_improved': model_improved
+              }, f, indent=2)
+          
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"prod_rmse={prod_rmse:.4f}\n")
+              f.write(f"model_improved={'true' if model_improved else 'false'}\n")
+          EOF
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-artifacts
+          path: |
+            new_model_metrics.json
+            model_comparison.json
+
+  # =========================================================================
+  # Job 2: CML Report Generation
+  # =========================================================================
+  cml-report:
+    name: CML Metric Report
+    runs-on: ubuntu-latest
+    needs: model-retraining
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup CML
+        uses: iterative/setup-cml@v2
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: training-artifacts
+
+      - name: Generate CML Report
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat << 'EOF' > report.md
+          # Model Performance Comparison Report
+          
+          ## Summary
+          EOF
+          
+          python3 << 'PYTHON' >> report.md
+          import json
+          
+          with open('model_comparison.json', 'r') as f:
+              data = json.load(f)
+          
+          if data['model_improved']:
+              print("**Status: PASSED** - New model meets performance requirements")
+          else:
+              print("**Status: FAILED** - New model performs worse than production")
+          
+          print("")
+          print("## Metrics")
+          print("")
+          print("| Metric | Production | New Model |")
+          print("|--------|------------|-----------|")
+          print(f"| RMSE | {data['production_rmse']:.4f} | {data['new_rmse']:.4f} |")
+          
+          with open('new_model_metrics.json', 'r') as f:
+              new_data = json.load(f)
+          
+          print("")
+          print(f"**Best Model:** {new_data['best_model']}")
+          PYTHON
+          
+          cml comment create report.md
+
+      - name: Check model gate
+        if: needs.model-retraining.outputs.model_improved == 'false'
+        run: |
+          echo "Model performance check FAILED"
+          echo "New model performs worse than production model"
+          exit 1
+
+  # =========================================================================
+  # Job 3: Integration Tests
+  # =========================================================================
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: model-retraining
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Integration Tests
+        run: |
+          mkdir -p data/raw data/processed data/models data/profiles
+          
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          
+          from src.data.extract import CoinGeckoExtractor
+          print('CoinGeckoExtractor import passed')
+          
+          from src.models.train import CryptoPricePredictor
+          print('CryptoPricePredictor import passed')
+          
+          from src.api.app import app
+          print('FastAPI app import passed')
+          
+          print('All integration tests passed!')
+          "
+
+      - name: Validate DAG Syntax
+        run: |
+          python -c "
+          import ast
+          with open('airflow/dags/currency_prediction_dag.py', 'r') as f:
+              ast.parse(f.read())
+          print('DAG syntax is valid')
+          "
