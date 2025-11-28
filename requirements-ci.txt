@@ -1,0 +1,60 @@
+# CI/CD Requirements (subset for GitHub Actions testing)
+# This avoids dependency conflicts between apache-airflow and dvc
+
+# Core data processing
+pandas==2.0.3
+numpy==1.24.3
+scipy==1.11.1
+
+# Machine Learning
+scikit-learn==1.3.0
+joblib==1.3.1
+
+# Data validation - MUST be <2.0.0 for airflow compatibility
+pydantic>=1.10.0,<2.0.0
+
+# API and web framework
+fastapi==0.100.1
+uvicorn[standard]==0.23.1
+httpx==0.24.1
+
+# HTTP requests
+requests==2.31.0
+
+# Apache Airflow (for DAG validation)
+apache-airflow==2.6.3
+
+# Experiment tracking
+mlflow==2.5.0
+
+# Database connections
+psycopg2-binary==2.9.7
+sqlalchemy==1.4.49
+
+# Cloud storage
+minio==7.1.15
+boto3==1.28.25
+
+# Visualization
+matplotlib==3.7.2
+seaborn==0.12.2
+
+# Configuration management
+python-dotenv==1.0.0
+pyyaml==6.0.1
+
+# Testing
+pytest==7.4.0
+pytest-cov==4.1.0
+pytest-mock==3.11.1
+pytest-asyncio==0.21.1
+
+# Code quality
+flake8==6.0.0
+
+# Time series analysis
+statsmodels==0.14.0
+
+# Additional utilities
+tqdm==4.65.0
+python-multipart==0.0.6

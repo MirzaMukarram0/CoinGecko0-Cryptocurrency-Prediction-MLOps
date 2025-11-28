@@ -1,0 +1,29 @@
+# Docker API Requirements (minimal for FastAPI deployment)
+# This is a subset for the containerized prediction API
+
+# Core data processing
+pandas==2.0.3
+numpy==1.24.3
+scipy==1.11.1
+
+# Machine Learning
+scikit-learn==1.3.0
+joblib==1.3.1
+
+# Data validation
+pydantic>=1.10.0,<2.0.0
+
+# API and web framework
+fastapi==0.100.1
+uvicorn[standard]==0.23.1
+httpx==0.24.1
+
+# HTTP requests
+requests==2.31.0
+
+# Configuration management
+python-dotenv==1.0.0
+pyyaml==6.0.1
+
+# Additional utilities
+python-multipart==0.0.6
