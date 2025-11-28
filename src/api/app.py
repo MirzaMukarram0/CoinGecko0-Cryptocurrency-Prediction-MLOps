@@ -71,8 +71,6 @@ model_metadata = {}
 # Utility functions
 def load_model_if_needed(model_type: str = "random_forest"):
     """Load model if not already loaded"""
-    global loaded_models, model_metadata
-    
     if model_type not in loaded_models:
         try:
             # Find the latest model files
@@ -304,8 +302,6 @@ async def unload_model(model_type: str):
     """
     Unload a specific model from memory
     """
-    global loaded_models, model_metadata
-    
     if model_type in loaded_models:
         del loaded_models[model_type]
         if model_type in model_metadata:
@@ -342,7 +338,6 @@ async def shutdown_event():
     logger.info("Shutting down Cryptocurrency Prediction API...")
     
     # Clear loaded models
-    global loaded_models, model_metadata
     loaded_models.clear()
     model_metadata.clear()
     
