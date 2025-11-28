@@ -15,6 +15,12 @@ on:
     branches:
       - test
 
+# Required permissions for CML to post comments on PRs
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
 env:
   PYTHONPATH: ${{ github.workspace }}
   MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
