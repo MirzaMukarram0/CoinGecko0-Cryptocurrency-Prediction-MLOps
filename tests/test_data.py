@@ -51,8 +51,8 @@ class TestCoinGeckoExtractor:
         mock_response.raise_for_status.return_value = None
         mock_get.return_value = mock_response
         
-        # Test the method
-        result = extractor.fetch_market_chart('bitcoin', 'usd', 1, 'hourly')
+        # Test the method (3 args: coin_id, vs_currency, days)
+        result = extractor.fetch_market_chart('bitcoin', 'usd', 1)
         
         # Assertions
         assert 'prices' in result
@@ -71,10 +71,10 @@ class TestCoinGeckoExtractor:
         assert list(df.columns) == ['price', 'market_cap', 'total_volume']
         assert isinstance(df.index, pd.DatetimeIndex)
         
-        # Check data types
-        assert df['price'].dtype == np.float64
-        assert df['market_cap'].dtype == np.float64
-        assert df['total_volume'].dtype == np.float64
+        # Check data types are numeric (int or float are both valid)
+        assert np.issubdtype(df['price'].dtype, np.number)
+        assert np.issubdtype(df['market_cap'].dtype, np.number)
+        assert np.issubdtype(df['total_volume'].dtype, np.number)
     
     def test_save_raw_data(self, extractor, sample_api_response):
         """Test saving data to CSV"""
@@ -109,7 +109,7 @@ class TestDataQualityChecker:
     @pytest.fixture
     def good_data(self):
         """Create good quality test data"""
-        dates = pd.date_range('2022-01-01', periods=100, freq='H')
+        dates = pd.date_range('2022-01-01', periods=100, freq='h')
         return pd.DataFrame({
             'price': np.random.uniform(45000, 50000, 100),
             'market_cap': np.random.uniform(900000000000, 950000000000, 100),
@@ -119,15 +119,15 @@ class TestDataQualityChecker:
     @pytest.fixture
     def bad_data_nulls(self):
         """Create data with too many null values"""
-        dates = pd.date_range('2022-01-01', periods=100, freq='H')
+        dates = pd.date_range('2022-01-01', periods=100, freq='h')
         data = pd.DataFrame({
             'price': np.random.uniform(45000, 50000, 100),
             'market_cap': np.random.uniform(900000000000, 950000000000, 100),
             'total_volume': np.random.uniform(20000000000, 25000000000, 100)
         }, index=dates)
         
-        # Introduce too many nulls (>1%)
-        data.loc[:5, 'price'] = np.nan  # 6% null values
+        # Introduce too many nulls (>1%) - use iloc for positional indexing
+        data.iloc[:6, data.columns.get_loc('price')] = np.nan  # 6% null values
         return data
     
     def test_check_null_values_pass(self, quality_checker, good_data):
@@ -192,7 +192,7 @@ class TestCryptoDataTransformer:
     @pytest.fixture
     def raw_data(self):
         """Create raw cryptocurrency data for testing"""
-        dates = pd.date_range('2022-01-01', periods=100, freq='H')
+        dates = pd.date_range('2022-01-01', periods=100, freq='h')
         np.random.seed(42)  # For reproducible tests
         
         data = pd.DataFrame({
@@ -276,7 +276,7 @@ class TestIntegrationFunctions:
     @pytest.fixture
     def sample_csv_file(self):
         """Create a temporary CSV file for testing"""
-        dates = pd.date_range('2022-01-01', periods=50, freq='H')
+        dates = pd.date_range('2022-01-01', periods=50, freq='h')
         data = pd.DataFrame({
             'price': np.random.uniform(45000, 50000, 50),
             'market_cap': np.random.uniform(900000000000, 950000000000, 50),

@@ -161,25 +161,50 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Check Docker Hub credentials
+        id: docker-creds
+        run: |
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "has_creds=true" >> $GITHUB_OUTPUT
+            echo "Docker Hub credentials found"
+          else
+            echo "has_creds=false" >> $GITHUB_OUTPUT
+            echo "Docker Hub credentials not configured - will build locally only"
+          fi
+
       - name: Login to Docker Hub
+        if: steps.docker-creds.outputs.has_creds == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
 
-      - name: Build and push
+      - name: Build and push (with Docker Hub)
+        if: steps.docker-creds.outputs.has_creds == 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile.api
-          push: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+          push: true
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:v1.0.${{ github.run_number }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-        continue-on-error: true
+
+      - name: Build locally (no Docker Hub)
+        if: steps.docker-creds.outputs.has_creds != 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.api
+          push: false
+          load: true
+          tags: |
+            ${{ env.DOCKER_IMAGE_NAME }}:latest
+            ${{ env.DOCKER_IMAGE_NAME }}:v1.0.${{ github.run_number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   # =========================================================================
   # Job 4: Deployment Verification
