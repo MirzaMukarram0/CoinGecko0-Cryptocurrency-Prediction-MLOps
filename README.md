@@ -99,7 +99,8 @@ A comprehensive MLOps pipeline for cryptocurrency price prediction using Apache 
 | **Storage** | MinIO, S3, Azure Blob | Object storage for datasets |
 | **Containerization** | Docker, Docker Compose | Service orchestration |
 | **Database** | PostgreSQL | Airflow metadata and workflow state |
-| **Monitoring** | Airflow UI, MLflow UI | Pipeline and experiment monitoring |
+| **Monitoring** | Prometheus, Grafana | Metrics collection, visualization, and alerting |
+| **API Framework** | FastAPI | REST API for predictions |
 
 ## 📋 Prerequisites
 
@@ -254,18 +255,183 @@ python src/utils/dvc_version.py data/test/sample.csv
 - Infrastructure as Code (IaC)
 - Environment promotion workflow
 
-### Phase IV: Production Monitoring
-- Model performance monitoring
-- Data drift detection
-- Automated retraining triggers
-- Alerting and notifications
+### Phase IV: Monitoring and Observability (COMPLETE ✅)
+
+✅ **Prometheus Metrics Collection**
+- Embedded Prometheus client in FastAPI server
+- Service metrics: API inference latency, total request count
+- Model metrics: Prediction count, prediction latency
+- Data drift metrics: Out-of-distribution feature ratio
+- Real-time metrics exposure at `/metrics` endpoint
+
+✅ **Grafana Dashboards**
+- Live dashboard for service and model health metrics
+- Real-time visualization of API performance
+- Data drift monitoring and visualization
+- Model health status tracking
+
+✅ **Alerting System**
+- Grafana alerts for high latency (>500ms threshold)
+- Data drift spike detection alerts (>30% threshold)
+- Model health status alerts
+- Configurable alert notifications
+
+## 📊 Phase IV: Monitoring Setup Guide
+
+> **🚀 Quick Start:** See [QUICK_START.md](QUICK_START.md) for a 5-minute setup guide
+> 
+> **📖 Complete Guide:** See [COMPLETE_SETUP_GUIDE.md](COMPLETE_SETUP_GUIDE.md) for detailed step-by-step instructions
+
+### Quick Setup (5 Minutes)
+
+### Prerequisites
+- Docker and Docker Compose installed
+- All services from Phase I running
+
+### Step 1: Start Monitoring Services
+
+```bash
+# Start all services including Prometheus and Grafana
+docker-compose up -d
+
+# Verify all services are running
+docker-compose ps
+```
+
+### Step 2: Access Monitoring Dashboards
+
+| Service | URL | Credentials |
+|---------|-----|-------------|
+| **Grafana** | http://localhost:3000 | admin / admin |
+| **Prometheus** | http://localhost:9090 | - |
+| **FastAPI** | http://localhost:8000 | - |
+| **API Metrics** | http://localhost:8000/metrics | - |
+
+### Step 3: Initialize Data Drift Detection
+
+Before drift detection works, you need to initialize it with training data statistics:
+
+```bash
+# Initialize drift detector from training data
+python src/utils/init_drift_detector.py data/processed/your_training_data.csv \
+    --features models/your_model_features.joblib \
+    --output monitoring/training_stats.json
+```
+
+Or programmatically in your code:
+
+```python
+from src.utils.metrics import drift_detector
+import pandas as pd
+
+# Load your training data
+df = pd.read_csv('data/processed/training_data.csv')
+
+# Calculate and set training statistics
+from src.utils.init_drift_detector import calculate_training_stats
+stats = calculate_training_stats(df, feature_columns)
+drift_detector.set_training_stats(stats)
+```
+
+### Step 4: View Grafana Dashboard
+
+1. Open http://localhost:3000
+2. Login with admin/admin
+3. Navigate to **Dashboards** → **Cryptocurrency Prediction API - Monitoring Dashboard**
+4. The dashboard will automatically load with:
+   - API Request Rate
+   - API Request Latency (P50, P95, P99)
+   - Total API Requests
+   - Active API Requests
+   - Model Prediction Rate
+   - Model Prediction Latency
+   - Data Drift Ratio
+   - Data Drift Detections
+   - Model Health Status
+   - API Endpoint Summary
+
+### Step 5: Configure Alerts
+
+The dashboard includes pre-configured alerts:
+
+1. **High Latency Alert**: Fires when P95 latency > 500ms for 5 minutes
+2. **Data Drift Spike Alert**: Fires when drift ratio > 30% for 2 minutes
+
+To configure alert notifications (Slack, email, etc.):
+
+1. Go to **Alerting** → **Notification channels** in Grafana
+2. Add your notification channel
+3. Edit the alert rules in the dashboard to use your channel
+
+### Available Metrics
+
+#### Service Metrics
+- `api_requests_total`: Total API requests by method, endpoint, status
+- `api_request_latency_seconds`: Request latency histogram
+- `api_active_requests`: Current number of active requests
+
+#### Model Metrics
+- `model_predictions_total`: Total predictions by model type and coin
+- `model_prediction_latency_seconds`: Prediction latency histogram
+- `model_health_status`: Model health (1=healthy, 0=unhealthy)
+
+#### Data Drift Metrics
+- `data_drift_ratio`: Ratio of out-of-distribution features (0.0-1.0)
+- `data_drift_detections_total`: Total drift detections by model and feature
+
+### Testing the Monitoring System
+
+1. **Generate API Traffic**:
+   ```bash
+   # Make prediction requests
+   curl -X POST http://localhost:8000/predict \
+     -H "Content-Type: application/json" \
+     -d '{"coin_id": "bitcoin", "hours_ahead": 1}'
+   ```
+
+2. **Check Metrics Endpoint**:
+   ```bash
+   curl http://localhost:8000/metrics
+   ```
+
+3. **View in Prometheus**:
+   - Go to http://localhost:9090
+   - Try queries like: `rate(api_requests_total[5m])`
+   - Or: `data_drift_ratio`
+
+4. **Monitor in Grafana**:
+   - Watch real-time updates in the dashboard
+   - Check alert status
+
+### Troubleshooting
+
+**Metrics not appearing?**
+- Ensure the API service is running: `docker-compose ps api`
+- Check API logs: `docker-compose logs api`
+- Verify metrics endpoint: `curl http://localhost:8000/metrics`
+
+**Prometheus not scraping?**
+- Check Prometheus targets: http://localhost:9090/targets
+- Verify API is accessible from Prometheus container
+- Check Prometheus logs: `docker-compose logs prometheus`
+
+**Grafana dashboard not loading?**
+- Check Grafana logs: `docker-compose logs grafana`
+- Verify Prometheus datasource is configured
+- Check dashboard JSON syntax
+
+**Data drift not working?**
+- Ensure training stats are initialized (see Step 3)
+- Check that feature names match between training and prediction
+- Verify drift detector is initialized in API startup
 
 ## 📚 Documentation
 
 - **Phase 1 Details**: See [phase_1.md](phase_1.md)
+- **Phase 4 Details**: See monitoring setup guide above
 - **API Documentation**: Auto-generated from docstrings
 - **Configuration Guide**: See `config/` directory
-- **Troubleshooting**: Check Airflow logs and MLflow UI
+- **Troubleshooting**: Check Airflow logs, MLflow UI, and monitoring dashboards
 
 ## 🤝 Contributing
 
@@ -288,4 +454,4 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ---
 
-**Status**: Phase I Complete ✅ | **Next**: Model Experimentation Phase II
+**Status**: Phase I & IV Complete ✅ | **Next**: Model Experimentation Phase II

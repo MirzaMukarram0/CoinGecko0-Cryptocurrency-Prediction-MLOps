@@ -1,0 +1,35 @@
+# Dockerfile for FastAPI Prediction API
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy API-specific requirements (excludes Airflow and DVC to avoid dependency conflicts)
+COPY requirements-api.txt ./requirements.txt
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Create directories for models and data (will be mounted as volumes)
+RUN mkdir -p ./models ./data
+
+# Copy source code
+COPY src/ ./src/
+
+# Note: Models and data directories are created but left empty
+# They will be populated via volumes in docker-compose or at runtime
+
+# Expose API port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl --fail http://localhost:8000/health || exit 1
+
+# Run the API
+CMD ["uvicorn", "src.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+
