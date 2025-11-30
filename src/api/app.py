@@ -2,7 +2,9 @@
 FastAPI Application for Cryptocurrency Price Prediction
 Provides REST API endpoints for real-time price predictions
 """
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Response
+from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi.responses import Response as FastAPIResponse
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 import pandas as pd
@@ -12,6 +14,7 @@ import os
 import json
 from datetime import datetime, timedelta
 import asyncio
+import time
 
 # Import our modules
 import sys
@@ -20,6 +23,10 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 from src.data.extract import extract_coingecko_data
 from src.data.transform import transform_data
 from src.models.predict import CryptoPricePredictor
+from src.utils.metrics import (
+    record_api_request, record_prediction, set_model_health,
+    get_metrics, drift_detector, api_active_requests
+)
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -31,6 +38,40 @@ app = FastAPI(
     description="Real-time cryptocurrency price prediction using machine learning",
     version="1.0.0"
 )
+
+
+# Prometheus Metrics Middleware
+class MetricsMiddleware(BaseHTTPMiddleware):
+    """Middleware to track API request metrics"""
+    
+    async def dispatch(self, request: Request, call_next):
+        start_time = time.time()
+        method = request.method
+        endpoint = request.url.path
+        
+        # Increment active requests
+        api_active_requests.inc()
+        
+        try:
+            response = await call_next(request)
+            status = "success" if response.status_code < 400 else "error"
+            
+            # Record metrics
+            duration = time.time() - start_time
+            record_api_request(method, endpoint, status, duration)
+            
+            return response
+        except Exception as e:
+            duration = time.time() - start_time
+            record_api_request(method, endpoint, "error", duration)
+            raise
+        finally:
+            # Decrement active requests
+            api_active_requests.dec()
+
+
+# Add middleware
+app.add_middleware(MetricsMiddleware)
 
 
 # Pydantic models for request/response
@@ -145,9 +186,22 @@ async def root():
             "/predict",
             "/predict/batch", 
             "/models/status",
-            "/health"
+            "/health",
+            "/metrics"
         ]
     }
+
+
+@app.get("/metrics")
+async def metrics():
+    """
+    Prometheus metrics endpoint
+    Exposes all metrics in Prometheus format
+    """
+    return FastAPIResponse(
+        content=get_metrics(),
+        media_type="text/plain"
+    )
 
 
 @app.get("/health")
@@ -187,15 +241,38 @@ async def predict_price(request: PredictionRequest) -> PredictionResponse:
     """
     Predict cryptocurrency price for the next N hours
     """
+    prediction_start = time.time()
+    drift_ratio = 0.0
+    
     try:
         # Load model if needed
         load_model_if_needed(request.model_type)
+        set_model_health(request.model_type, True)
         
         # Get latest data
         df = await get_latest_data(request.coin_id, hours=48)
         
         # Get predictor
         predictor = loaded_models[request.model_type]
+        
+        # Detect data drift before prediction
+        try:
+            latest_timestamp = df.index[-1]
+            latest_row = df.loc[latest_timestamp]
+            
+            # Convert to dictionary for drift detection
+            features_dict = latest_row.to_dict()
+            
+            # Calculate drift ratio
+            drift_ratio = drift_detector.calculate_drift_ratio(
+                features_dict, 
+                model_type=request.model_type
+            )
+            
+            logger.info(f"Data drift ratio: {drift_ratio:.4f} for {request.model_type}")
+        except Exception as drift_error:
+            logger.warning(f"Could not calculate drift: {drift_error}")
+            drift_ratio = 0.0
         
         # Make prediction
         if request.hours_ahead == 1:
@@ -207,6 +284,15 @@ async def predict_price(request: PredictionRequest) -> PredictionResponse:
             # Multi-step prediction
             future_predictions = predictor.predict_future(df, request.hours_ahead)
             predicted_price = future_predictions[-1]['predicted_price']
+        
+        # Record prediction metrics
+        prediction_duration = time.time() - prediction_start
+        record_prediction(
+            model_type=request.model_type,
+            coin_id=request.coin_id,
+            duration=prediction_duration,
+            drift_ratio=drift_ratio
+        )
         
         # Create response
         response = PredictionResponse(
@@ -221,6 +307,14 @@ async def predict_price(request: PredictionRequest) -> PredictionResponse:
         
     except Exception as e:
         logger.error(f"Prediction error: {e}")
+        set_model_health(request.model_type, False)
+        prediction_duration = time.time() - prediction_start
+        record_prediction(
+            model_type=request.model_type,
+            coin_id=request.coin_id,
+            duration=prediction_duration,
+            drift_ratio=drift_ratio
+        )
         raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
 
@@ -229,9 +323,13 @@ async def predict_batch(request: BatchPredictionRequest) -> List[PredictionRespo
     """
     Generate batch predictions for a date range
     """
+    prediction_start = time.time()
+    drift_ratio = 0.0
+    
     try:
         # Load model if needed
         load_model_if_needed(request.model_type)
+        set_model_health(request.model_type, True)
         
         # Parse dates
         start_date = pd.to_datetime(request.start_date)
@@ -256,11 +354,36 @@ async def predict_batch(request: BatchPredictionRequest) -> List[PredictionRespo
         if len(filtered_df) == 0:
             raise HTTPException(status_code=404, detail="No data available for the requested date range")
         
+        # Detect data drift on first row
+        try:
+            first_row = filtered_df.iloc[0]
+            features_dict = first_row.to_dict()
+            drift_ratio = drift_detector.calculate_drift_ratio(
+                features_dict,
+                model_type=request.model_type
+            )
+        except Exception as drift_error:
+            logger.warning(f"Could not calculate drift: {drift_error}")
+            drift_ratio = 0.0
+        
         # Get predictor
         predictor = loaded_models[request.model_type]
         
         # Make batch predictions
         predictions_df = predictor.predict_batch(filtered_df, start_date, end_date)
+        
+        # Record metrics (use average per prediction)
+        prediction_duration = time.time() - prediction_start
+        avg_duration_per_prediction = prediction_duration / len(predictions_df) if len(predictions_df) > 0 else prediction_duration
+        
+        # Record metrics for each prediction in the batch
+        for _ in predictions_df.iterrows():
+            record_prediction(
+                model_type=request.model_type,
+                coin_id=request.coin_id,
+                duration=avg_duration_per_prediction,
+                drift_ratio=drift_ratio
+            )
         
         # Convert to response format
         responses = []
@@ -278,6 +401,14 @@ async def predict_batch(request: BatchPredictionRequest) -> List[PredictionRespo
         
     except Exception as e:
         logger.error(f"Batch prediction error: {e}")
+        set_model_health(request.model_type, False)
+        prediction_duration = time.time() - prediction_start
+        record_prediction(
+            model_type=request.model_type,
+            coin_id=request.coin_id,
+            duration=prediction_duration,
+            drift_ratio=drift_ratio
+        )
         raise HTTPException(status_code=500, detail=f"Batch prediction failed: {str(e)}")
 
 
@@ -321,6 +452,22 @@ async def unload_model(model_type: str):
 async def startup_event():
     """Initialize API on startup"""
     logger.info("Starting Cryptocurrency Prediction API...")
+    
+    # Try to load training stats for drift detection
+    try:
+        training_stats_file = os.getenv("TRAINING_STATS_FILE", "monitoring/training_stats.json")
+        if os.path.exists(training_stats_file):
+            import json
+            with open(training_stats_file, 'r') as f:
+                training_stats = json.load(f)
+            drift_detector.set_training_stats(training_stats)
+            logger.info(f"✓ Training stats loaded from {training_stats_file}")
+            logger.info(f"  Initialized drift detection for {len(training_stats)} features")
+        else:
+            logger.warning(f"Training stats file not found: {training_stats_file}")
+            logger.warning("  Data drift detection will not work until training stats are initialized")
+    except Exception as e:
+        logger.warning(f"Could not load training stats: {e}")
     
     # Try to load default model
     try:
