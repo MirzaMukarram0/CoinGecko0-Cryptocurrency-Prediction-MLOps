@@ -58,3 +58,6 @@ statsmodels==0.14.0
 # Additional utilities
 tqdm==4.65.0
 python-multipart==0.0.6
+
+# Monitoring and Observability
+prometheus-client==0.18.0
