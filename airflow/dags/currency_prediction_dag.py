@@ -27,7 +27,7 @@ default_args = {
 # Configuration
 COIN_ID = 'bitcoin'
 VS_CURRENCY = 'usd'
-DAYS = 7  # Increased from 2 to 7 days for more training data (~168 hourly records)
+DAYS = 30  # Increased to 30 days for ~720 hourly records (much better for ML!)
 MAX_NULL_PERCENTAGE = 1.0
 
 # Paths - use /opt/airflow as base
