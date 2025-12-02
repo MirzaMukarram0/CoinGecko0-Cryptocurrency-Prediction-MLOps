@@ -27,7 +27,7 @@ default_args = {
 # Configuration
 COIN_ID = 'bitcoin'
 VS_CURRENCY = 'usd'
-DAYS = 2
+DAYS = 7  # Increased from 2 to 7 days for more training data (~168 hourly records)
 MAX_NULL_PERCENTAGE = 1.0
 
 # Paths - use /opt/airflow as base
@@ -689,7 +689,7 @@ def dvc_versioning_task(**context):
 def train_model_task(**context):
     """
     Train cryptocurrency price prediction models with MLflow tracking.
-    Logs experiments to DagHub MLflow server.
+    Logs experiments to DagHub MLflow server or locally if unavailable.
     
     Models trained:
     - Random Forest
@@ -702,13 +702,18 @@ def train_model_task(**context):
     - Training time
     """
     import sys
+    import os
+    import json
     sys.path.insert(0, '/opt/airflow')
-    
-    from src.models.train import train_with_mlflow
     
     logger.info("=" * 60)
     logger.info("STARTING MODEL TRAINING WITH MLFLOW")
     logger.info("=" * 60)
+    
+    # Log environment for debugging
+    logger.info(f"MLFLOW_TRACKING_URI: {os.getenv('MLFLOW_TRACKING_URI', 'not set')}")
+    logger.info(f"MLFLOW_TRACKING_USERNAME: {os.getenv('MLFLOW_TRACKING_USERNAME', 'not set')}")
+    logger.info(f"MLFLOW_TRACKING_PASSWORD: {'***' if os.getenv('MLFLOW_TRACKING_PASSWORD') else 'not set'}")
     
     # Get processed filepath from profiling task
     ti = context['ti']
@@ -720,21 +725,51 @@ def train_model_task(**context):
     
     logger.info(f"Training on data: {processed_filepath}")
     
-    # Train models with MLflow tracking
-    results = train_with_mlflow(data_path=processed_filepath)
-    
-    logger.info("=" * 60)
-    logger.info("✓ MODEL TRAINING COMPLETE")
-    logger.info(f"   Best Model: {results.get('best_model')}")
-    logger.info(f"   Best RMSE: {results.get('best_rmse', 'N/A')}")
-    logger.info("=" * 60)
-    
-    return {
-        'best_model': results.get('best_model'),
-        'best_rmse': results.get('best_rmse'),
-        'models_trained': list(results.get('results', {}).keys()),
-        'processed_filepath': processed_filepath
-    }
+    try:
+        from src.models.train import train_with_mlflow
+        
+        # Train models with MLflow tracking
+        results = train_with_mlflow(data_path=processed_filepath)
+        
+        logger.info("=" * 60)
+        logger.info("✓ MODEL TRAINING COMPLETE")
+        logger.info(f"   Best Model: {results.get('best_model')}")
+        logger.info(f"   Best RMSE: {results.get('best_rmse', 'N/A')}")
+        logger.info("=" * 60)
+        
+        # Save training summary for CI/CD to read
+        summary_path = '/opt/airflow/data/models/training_summary.json'
+        os.makedirs(os.path.dirname(summary_path), exist_ok=True)
+        
+        training_summary = {
+            'best_model': {
+                'model_name': results.get('best_model'),
+                'test_rmse': results.get('best_rmse'),
+                'test_mae': results.get('results', {}).get(results.get('best_model'), {}).get('metrics', {}).get('test_mae', 0),
+                'test_r2': results.get('results', {}).get(results.get('best_model'), {}).get('metrics', {}).get('test_r2', 0)
+            },
+            'models_trained': list(results.get('results', {}).keys()),
+            'processed_filepath': processed_filepath
+        }
+        
+        with open(summary_path, 'w') as f:
+            json.dump(training_summary, f, indent=2)
+        
+        logger.info(f"Training summary saved to: {summary_path}")
+        
+        return {
+            'best_model': results.get('best_model'),
+            'best_rmse': results.get('best_rmse'),
+            'models_trained': list(results.get('results', {}).keys()),
+            'processed_filepath': processed_filepath
+        }
+        
+    except Exception as e:
+        logger.error(f"Training failed with error: {str(e)}")
+        logger.error(f"Exception type: {type(e).__name__}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
 
 
 # ============================================================================

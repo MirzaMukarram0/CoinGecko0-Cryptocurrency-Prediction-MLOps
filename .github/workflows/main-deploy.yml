@@ -1,7 +1,7 @@
 # ============================================================================
 # MAIN BRANCH - PRODUCTION DEPLOYMENT (Test -> Main)
 # ============================================================================
-# Runs on PRs from test to main branch
+# Runs on merge from test to main branch (not direct push)
 # Performs full production deployment:
 # 1. Fetch best model from MLflow Model Registry
 # 2. Build Docker image with FastAPI
@@ -11,10 +11,12 @@
 name: Main - Production Deployment
 
 on:
+  # Only trigger on push (which includes merges) - not on PR open
   push:
     branches: 
       - main
       - master
+  # PR events for validation only (no deployment)
   pull_request:
     branches: 
       - main
@@ -127,11 +129,26 @@ jobs:
     name: Build Docker Image
     runs-on: ubuntu-latest
     needs: [final-validation, fetch-model]
-    if: github.event_name == 'push'
+    # Only run on push (merge) events, not on PR
+    # This ensures deployment only happens after PR is merged
+    if: github.event_name == 'push' && contains(github.event.head_commit.message, 'Merge pull request')
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Verify this is a merge from test branch
+        run: |
+          echo "Commit message: ${{ github.event.head_commit.message }}"
+          echo "This deployment was triggered by a merge to main"
+          
+          # Check if merge is from test branch (optional validation)
+          if echo "${{ github.event.head_commit.message }}" | grep -q "from.*test"; then
+            echo "✅ Merge from test branch confirmed"
+          else
+            echo "⚠️ Warning: This merge may not be from test branch"
+            echo "Continuing with deployment..."
+          fi
 
       - name: Create Dockerfile
         run: |
@@ -213,7 +230,7 @@ jobs:
     name: Deployment Verification
     runs-on: ubuntu-latest
     needs: build-docker
-    if: github.event_name == 'push'
+    # Only run when build-docker runs (which is only on merge)
     
     steps:
       - name: Checkout code
@@ -276,7 +293,8 @@ jobs:
     name: Deployment Summary
     runs-on: ubuntu-latest
     needs: [final-validation, fetch-model, build-docker, deployment-verification]
-    if: always() && github.event_name == 'push'
+    # Run summary after deployment jobs (only triggered on merge)
+    if: always() && github.event_name == 'push' && contains(github.event.head_commit.message, 'Merge pull request')
     
     steps:
       - name: Summary

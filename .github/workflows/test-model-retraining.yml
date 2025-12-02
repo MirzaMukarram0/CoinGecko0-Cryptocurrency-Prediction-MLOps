@@ -2,7 +2,8 @@
 # TEST BRANCH - MODEL RETRAINING WITH CML (Dev -> Test)
 # ============================================================================
 # Runs on PRs from dev to test branch
-# Triggers model retraining and uses CML to generate metric comparison reports
+# Triggers the Airflow DAG to run a full data and model training pipeline
+# Uses CML to generate metric comparison reports in PR comments
 # Blocks merge if new model performs worse than production model
 
 name: Test - Model Retraining with CML
@@ -26,16 +27,19 @@ env:
   MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
   MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME }}
   MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
+  COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+  AIRFLOW_USERNAME: admin
+  AIRFLOW_PASSWORD: admin
 
 jobs:
   # =========================================================================
-  # Job 1: Model Retraining Pipeline
+  # Job 1: Trigger Airflow DAG for Full Pipeline
   # =========================================================================
-  model-retraining:
-    name: Model Retraining Pipeline
+  airflow-dag-pipeline:
+    name: Airflow DAG Pipeline
     runs-on: ubuntu-latest
     outputs:
-      new_model_rmse: ${{ steps.train.outputs.new_rmse }}
+      new_model_rmse: ${{ steps.get_metrics.outputs.new_rmse }}
       prod_model_rmse: ${{ steps.compare.outputs.prod_rmse }}
       model_improved: ${{ steps.compare.outputs.model_improved }}
     
@@ -43,146 +47,258 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install dependencies
+      - name: Create .env file for Docker
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements-ci.txt
-          pip install mlflow>=2.9.0
+          cat > .env << EOF
+          COINGECKO_API_KEY=${{ secrets.COINGECKO_API_KEY }}
+          MLFLOW_TRACKING_URI=${{ secrets.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_USERNAME=${{ secrets.MLFLOW_TRACKING_USERNAME }}
+          MLFLOW_TRACKING_PASSWORD=${{ secrets.MLFLOW_TRACKING_PASSWORD }}
+          EOF
 
       - name: Create data directories
         run: |
-          mkdir -p data/raw data/processed data/models data/profiles
+          mkdir -p data/raw data/processed data/models data/profiles data/dvc_files
+          chmod -R 777 data/
 
-      - name: Train model and get metrics
-        id: train
+      - name: Start Airflow infrastructure
         run: |
-          echo "Training new model..."
-          python << 'EOF'
-          import sys
+          echo "Starting Airflow infrastructure with Docker Compose..."
+          docker compose up -d postgres minio minio-init
+          
+          # Wait for postgres to be ready
+          echo "Waiting for PostgreSQL..."
+          sleep 15
+          
+          # Initialize Airflow
+          echo "Initializing Airflow..."
+          docker compose up airflow-init
+          
+          # Start Airflow services
+          echo "Starting Airflow scheduler and webserver..."
+          docker compose up -d airflow-scheduler airflow-webserver
+          
+          # Wait for Airflow to be ready
+          echo "Waiting for Airflow to be ready..."
+          sleep 45
+          
+          # Check if services are running
+          docker compose ps
+
+      - name: Trigger Airflow DAG
+        env:
+          AIRFLOW_API_URL: http://localhost:8080/api/v1
+          AIRFLOW_USER: ${{ env.AIRFLOW_USERNAME }}
+          AIRFLOW_PASS: ${{ env.AIRFLOW_PASSWORD }}
+          DAG_ID: cryptocurrency_mlops_pipeline
+        run: |
+          echo "Triggering ${DAG_ID}..."
+          
+          # Wait for webserver health
+          MAX_RETRIES=12
+          RETRY_COUNT=0
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            HEALTH_CHECK=$(curl -sf -u "${AIRFLOW_USER}:${AIRFLOW_PASS}" http://localhost:8080/health 2>&1)
+            if [ $? -eq 0 ]; then
+              echo "Airflow webserver is healthy!"
+              echo "Health check response: $HEALTH_CHECK"
+              break
+            fi
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "Waiting for Airflow webserver... (attempt $RETRY_COUNT/$MAX_RETRIES)"
+            sleep 10
+          done
+          
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "Failed to connect to Airflow webserver"
+            docker compose logs airflow-webserver --tail=50
+            exit 1
+          fi
+          
+          # Unpause the DAG first
+          echo "Unpausing DAG..."
+          UNPAUSE_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X PATCH "${AIRFLOW_API_URL}/dags/${DAG_ID}" \
+            -H "Content-Type: application/json" \
+            -u "${AIRFLOW_USER}:${AIRFLOW_PASS}" \
+            -d '{"is_paused": false}')
+          
+          HTTP_CODE=$(echo "$UNPAUSE_RESPONSE" | tail -n1)
+          RESPONSE_BODY=$(echo "$UNPAUSE_RESPONSE" | head -n-1)
+          
+          echo "Unpause HTTP Code: $HTTP_CODE"
+          echo "Unpause Response: $RESPONSE_BODY"
+          
+          if [ "$HTTP_CODE" -ne 200 ] && [ "$HTTP_CODE" -ne 204 ]; then
+            echo "Warning: Failed to unpause DAG (HTTP $HTTP_CODE), but continuing..."
+          fi
+          
+          sleep 5
+          
+          # Trigger the DAG
+          echo "Triggering DAG run..."
+          TRIGGER_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST "${AIRFLOW_API_URL}/dags/${DAG_ID}/dagRuns" \
+            -H "Content-Type: application/json" \
+            -u "${AIRFLOW_USER}:${AIRFLOW_PASS}" \
+            -d "{\"dag_run_id\": \"ci_run_$(date +%Y%m%d_%H%M%S)\", \"conf\": {}}")
+          
+          HTTP_CODE=$(echo "$TRIGGER_RESPONSE" | tail -n1)
+          RESPONSE_BODY=$(echo "$TRIGGER_RESPONSE" | head -n-1)
+          
+          echo "Trigger HTTP Code: $HTTP_CODE"
+          echo "Trigger Response: $RESPONSE_BODY"
+          
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "Error: Failed to trigger DAG (HTTP $HTTP_CODE)"
+            docker compose logs airflow-webserver --tail=50
+            exit 1
+          fi
+          
+          # Extract dag_run_id
+          DAG_RUN_ID=$(echo "$RESPONSE_BODY" | python3 -c "import sys, json; print(json.load(sys.stdin).get('dag_run_id', 'unknown'))" 2>/dev/null || echo "unknown")
+          echo "DAG Run ID: $DAG_RUN_ID"
+          
+          if [ "$DAG_RUN_ID" = "unknown" ]; then
+            echo "Error: Could not extract DAG Run ID"
+            exit 1
+          fi
+          
+          echo "dag_run_id=$DAG_RUN_ID" >> $GITHUB_ENV
+
+      - name: Wait for DAG completion
+        env:
+          AIRFLOW_API_URL: http://localhost:8080/api/v1
+          AIRFLOW_USER: ${{ env.AIRFLOW_USERNAME }}
+          AIRFLOW_PASS: ${{ env.AIRFLOW_PASSWORD }}
+          DAG_ID: cryptocurrency_mlops_pipeline
+        run: |
+          echo "Waiting for DAG to complete..."
+          DAG_RUN_ID="${{ env.dag_run_id }}"
+          
+          MAX_WAIT=600  # 10 minutes max
+          ELAPSED=0
+          INTERVAL=15
+          
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATUS_RESPONSE=$(curl -s \
+              -u "${AIRFLOW_USER}:${AIRFLOW_PASS}" \
+              "${AIRFLOW_API_URL}/dags/${DAG_ID}/dagRuns/$DAG_RUN_ID")
+            
+            STATE=$(echo "$STATUS_RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin).get('state', 'unknown'))" 2>/dev/null || echo "unknown")
+            
+            echo "DAG state: $STATE (elapsed: ${ELAPSED}s)"
+            
+            if [ "$STATE" = "success" ]; then
+              echo "DAG completed successfully!"
+              break
+            elif [ "$STATE" = "failed" ]; then
+              echo "DAG failed!"
+              echo "Response: $STATUS_RESPONSE"
+              # Get task instance logs
+              docker compose logs airflow-scheduler --tail=100
+              exit 1
+            elif [ "$STATE" = "unknown" ]; then
+              echo "Warning: Could not determine DAG state"
+              echo "Response: $STATUS_RESPONSE"
+            fi
+            
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+          
+          if [ $ELAPSED -ge $MAX_WAIT ]; then
+            echo "DAG did not complete within timeout"
+            docker compose logs airflow-scheduler --tail=100
+            exit 1
+          fi
+
+      - name: Get model metrics from DAG output
+        id: get_metrics
+        run: |
+          echo "Extracting model metrics..."
+          
+          # Check for training summary from DAG
+          if [ -f "data/models/training_summary.json" ]; then
+            echo "Found training_summary.json from DAG"
+            cat data/models/training_summary.json
+            
+            python3 << 'EOF'
           import json
           import os
-          sys.path.insert(0, '.')
           
-          import pandas as pd
-          import numpy as np
-          from sklearn.model_selection import train_test_split
-          from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-          from sklearn.linear_model import Ridge
-          from sklearn.preprocessing import StandardScaler
-          from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+          with open('data/models/training_summary.json', 'r') as f:
+              summary = json.load(f)
           
-          # Create synthetic data for CI testing
-          np.random.seed(42)
-          dates = pd.date_range('2024-01-01', periods=720, freq='h')
-          df = pd.DataFrame({
-              'price': 45000 + np.cumsum(np.random.randn(720) * 100),
-              'market_cap': 900e9 + np.cumsum(np.random.randn(720) * 1e9),
-              'total_volume': 20e9 + np.random.uniform(-1e9, 1e9, 720),
-              'hour': dates.hour,
-              'day_of_week': dates.dayofweek,
-          }, index=dates)
+          # Get best model metrics
+          best_model = summary.get('best_model', {})
+          rmse = best_model.get('test_rmse', 99999)
+          mae = best_model.get('test_mae', 99999)
+          r2 = best_model.get('test_r2', 0)
+          model_name = best_model.get('model_name', 'unknown')
           
-          # Add features
-          for lag in [1, 3, 6]:
-              df[f'price_lag_{lag}h'] = df['price'].shift(lag)
-          df['price_rolling_mean'] = df['price'].rolling(24).mean()
-          df.dropna(inplace=True)
-          
-          # Prepare data
-          target_col = 'price'
-          feature_cols = [col for col in df.columns if col != target_col]
-          X = df[feature_cols].values
-          y = df[target_col].values
-          
-          X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-          
-          scaler = StandardScaler()
-          X_train_scaled = scaler.fit_transform(X_train)
-          X_test_scaled = scaler.transform(X_test)
-          
-          # Train models
-          models = {
-              'random_forest': RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1),
-              'gradient_boosting': GradientBoostingRegressor(n_estimators=50, random_state=42),
-              'ridge': Ridge(alpha=1.0)
-          }
-          
-          best_rmse = float('inf')
-          best_model_name = None
-          results = {}
-          
-          for name, model in models.items():
-              model.fit(X_train_scaled, y_train)
-              y_pred = model.predict(X_test_scaled)
-              
-              rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-              mae = mean_absolute_error(y_test, y_pred)
-              r2 = r2_score(y_test, y_pred)
-              
-              results[name] = {'rmse': rmse, 'mae': mae, 'r2': r2}
-              
-              if rmse < best_rmse:
-                  best_rmse = rmse
-                  best_model_name = name
-          
-          best_metrics = results[best_model_name]
-          
-          # Save metrics
+          # Save for comparison
           with open('new_model_metrics.json', 'w') as f:
               json.dump({
-                  'best_model': best_model_name,
-                  'rmse': best_metrics['rmse'],
-                  'mae': best_metrics['mae'],
-                  'r2': best_metrics['r2'],
-                  'all_models': results
+                  'best_model': model_name,
+                  'rmse': rmse,
+                  'mae': mae,
+                  'r2': r2
               }, f, indent=2)
           
-          print(f"Best model: {best_model_name}")
-          print(f"RMSE: {best_metrics['rmse']:.4f}")
+          print(f"Best model: {model_name}, RMSE: {rmse:.4f}")
           
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"new_rmse={best_metrics['rmse']:.4f}\n")
+              f.write(f"new_rmse={rmse:.4f}\n")
           EOF
+          else
+            echo "Warning: training_summary.json not found, using fallback metrics"
+            # Fallback - extract from MLflow or use placeholder
+            echo '{"best_model": "unknown", "rmse": 99999, "mae": 99999, "r2": 0}' > new_model_metrics.json
+            echo "new_rmse=99999" >> $GITHUB_OUTPUT
+          fi
 
       - name: Compare with production model
         id: compare
         run: |
+          echo "Installing mlflow for comparison..."
+          pip install mlflow>=2.5.0 --quiet
+          
           echo "Comparing with production model..."
-          python << 'EOF'
+          python3 << 'EOF'
           import os
           import json
-          import mlflow
-          from mlflow.tracking import MlflowClient
           
-          tracking_uri = os.environ.get('MLFLOW_TRACKING_URI', '')
-          prod_rmse = 99999.0
-          
-          if tracking_uri:
-              try:
-                  mlflow.set_tracking_uri(tracking_uri)
-                  client = MlflowClient()
-                  
-                  # Try to get best run from experiments
-                  experiments = client.search_experiments()
-                  for exp in experiments:
-                      if exp.name != "Default":
-                          runs = client.search_runs(
-                              experiment_ids=[exp.experiment_id],
-                              order_by=["metrics.rmse ASC"],
-                              max_results=1
-                          )
-                          if runs:
-                              prod_rmse = float(runs[0].data.metrics.get('rmse', 99999))
-                              print(f"Found production model RMSE: {prod_rmse:.4f}")
-                              break
-              except Exception as e:
-                  print(f"Could not connect to MLflow: {e}")
+          try:
+              import mlflow
+              from mlflow.tracking import MlflowClient
+              
+              tracking_uri = os.environ.get('MLFLOW_TRACKING_URI', '')
+              prod_rmse = 99999.0
+              
+              if tracking_uri:
+                  try:
+                      mlflow.set_tracking_uri(tracking_uri)
+                      client = MlflowClient()
+                      
+                      # Try to get best run from experiments
+                      experiments = client.search_experiments()
+                      for exp in experiments:
+                          if exp.name != "Default":
+                              runs = client.search_runs(
+                                  experiment_ids=[exp.experiment_id],
+                                  order_by=["metrics.test_rmse ASC"],
+                                  max_results=1
+                              )
+                              if runs and 'test_rmse' in runs[0].data.metrics:
+                                  prod_rmse = float(runs[0].data.metrics['test_rmse'])
+                                  print(f"Found production model RMSE: {prod_rmse:.4f}")
+                                  break
+                  except Exception as e:
+                      print(f"Could not connect to MLflow: {e}")
+          except ImportError:
+              print("MLflow not available, using default production RMSE")
+              prod_rmse = 99999.0
           
           # Load new model metrics
           with open('new_model_metrics.json', 'r') as f:
@@ -217,6 +333,13 @@ jobs:
           path: |
             new_model_metrics.json
             model_comparison.json
+            data/models/
+
+      - name: Stop Airflow infrastructure
+        if: always()
+        run: |
+          echo "Stopping Airflow infrastructure..."
+          docker compose down -v || true
 
   # =========================================================================
   # Job 2: CML Report Generation
@@ -224,7 +347,7 @@ jobs:
   cml-report:
     name: CML Metric Report
     runs-on: ubuntu-latest
-    needs: model-retraining
+    needs: airflow-dag-pipeline
     if: github.event_name == 'pull_request'
     
     steps:
@@ -247,6 +370,9 @@ jobs:
           # Model Performance Comparison Report
           
           ## Summary
+          
+          **Pipeline:** Airflow DAG (Full Data & Model Training Pipeline)
+          
           EOF
           
           python3 << 'PYTHON' >> report.md
@@ -256,31 +382,39 @@ jobs:
               data = json.load(f)
           
           if data['model_improved']:
-              print("**Status: PASSED** - New model meets performance requirements")
+              print("**Status: PASSED** ✅ - New model meets performance requirements")
           else:
-              print("**Status: FAILED** - New model performs worse than production")
+              print("**Status: FAILED** ❌ - New model performs worse than production")
           
           print("")
-          print("## Metrics")
+          print("## Metrics Comparison")
           print("")
-          print("| Metric | Production | New Model |")
-          print("|--------|------------|-----------|")
-          print(f"| RMSE | {data['production_rmse']:.4f} | {data['new_rmse']:.4f} |")
+          print("| Metric | Production Model | New Model | Diff |")
+          print("|--------|------------------|-----------|------|")
+          diff = data['new_rmse'] - data['production_rmse']
+          diff_pct = (diff / data['production_rmse'] * 100) if data['production_rmse'] > 0 else 0
+          print(f"| RMSE | {data['production_rmse']:.4f} | {data['new_rmse']:.4f} | {diff:+.4f} ({diff_pct:+.2f}%) |")
           
           with open('new_model_metrics.json', 'r') as f:
               new_data = json.load(f)
           
           print("")
-          print(f"**Best Model:** {new_data['best_model']}")
+          print("## New Model Details")
+          print("")
+          print(f"- **Best Model Type:** {new_data['best_model']}")
+          print(f"- **RMSE:** {new_data['rmse']:.4f}")
+          print(f"- **MAE:** {new_data.get('mae', 'N/A')}")
+          print(f"- **R²:** {new_data.get('r2', 'N/A')}")
           PYTHON
           
           cml comment create report.md
 
       - name: Check model gate
-        if: needs.model-retraining.outputs.model_improved == 'false'
+        if: needs.airflow-dag-pipeline.outputs.model_improved == 'false'
         run: |
           echo "Model performance check FAILED"
           echo "New model performs worse than production model"
+          echo "Merge is BLOCKED until model performance improves"
           exit 1
 
   # =========================================================================
@@ -289,7 +423,7 @@ jobs:
   integration-tests:
     name: Integration Tests
     runs-on: ubuntu-latest
-    needs: model-retraining
+    needs: airflow-dag-pipeline
     
     steps:
       - name: Checkout code
