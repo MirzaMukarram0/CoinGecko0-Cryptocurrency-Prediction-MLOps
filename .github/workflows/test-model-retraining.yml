@@ -28,6 +28,8 @@ env:
   MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME }}
   MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
   COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+  AIRFLOW_USERNAME: admin
+  AIRFLOW_PASSWORD: admin
 
 jobs:
   # =========================================================================
@@ -84,6 +86,10 @@ jobs:
           docker compose ps
 
       - name: Trigger Airflow DAG
+        env:
+          AIRFLOW_API_URL: http://localhost:8080/api/v1
+          AIRFLOW_USER: ${{ env.AIRFLOW_USERNAME }}
+          AIRFLOW_PASS: ${{ env.AIRFLOW_PASSWORD }}
         run: |
           echo "Triggering currency_prediction_dag..."
           
@@ -91,8 +97,10 @@ jobs:
           MAX_RETRIES=12
           RETRY_COUNT=0
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+            HEALTH_CHECK=$(curl -sf -u "${AIRFLOW_USER}:${AIRFLOW_PASS}" http://localhost:8080/health 2>&1)
+            if [ $? -eq 0 ]; then
               echo "Airflow webserver is healthy!"
+              echo "Health check response: $HEALTH_CHECK"
               break
             fi
             RETRY_COUNT=$((RETRY_COUNT + 1))
@@ -100,30 +108,68 @@ jobs:
             sleep 10
           done
           
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "Failed to connect to Airflow webserver"
+            docker compose logs airflow-webserver --tail=50
+            exit 1
+          fi
+          
           # Unpause the DAG first
           echo "Unpausing DAG..."
-          curl -X PATCH "http://localhost:8080/api/v1/dags/currency_prediction_dag" \
+          UNPAUSE_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X PATCH "${AIRFLOW_API_URL}/dags/currency_prediction_dag" \
             -H "Content-Type: application/json" \
-            -u "admin:admin" \
-            -d '{"is_paused": false}' || true
+            -u "${AIRFLOW_USER}:${AIRFLOW_PASS}" \
+            -d '{"is_paused": false}')
+          
+          HTTP_CODE=$(echo "$UNPAUSE_RESPONSE" | tail -n1)
+          RESPONSE_BODY=$(echo "$UNPAUSE_RESPONSE" | head -n-1)
+          
+          echo "Unpause HTTP Code: $HTTP_CODE"
+          echo "Unpause Response: $RESPONSE_BODY"
+          
+          if [ "$HTTP_CODE" -ne 200 ] && [ "$HTTP_CODE" -ne 204 ]; then
+            echo "Warning: Failed to unpause DAG (HTTP $HTTP_CODE), but continuing..."
+          fi
           
           sleep 5
           
           # Trigger the DAG
           echo "Triggering DAG run..."
-          TRIGGER_RESPONSE=$(curl -X POST "http://localhost:8080/api/v1/dags/currency_prediction_dag/dagRuns" \
+          TRIGGER_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST "${AIRFLOW_API_URL}/dags/currency_prediction_dag/dagRuns" \
             -H "Content-Type: application/json" \
-            -u "admin:admin" \
+            -u "${AIRFLOW_USER}:${AIRFLOW_PASS}" \
             -d "{\"dag_run_id\": \"ci_run_$(date +%Y%m%d_%H%M%S)\", \"conf\": {}}")
           
-          echo "Trigger response: $TRIGGER_RESPONSE"
+          HTTP_CODE=$(echo "$TRIGGER_RESPONSE" | tail -n1)
+          RESPONSE_BODY=$(echo "$TRIGGER_RESPONSE" | head -n-1)
+          
+          echo "Trigger HTTP Code: $HTTP_CODE"
+          echo "Trigger Response: $RESPONSE_BODY"
+          
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "Error: Failed to trigger DAG (HTTP $HTTP_CODE)"
+            docker compose logs airflow-webserver --tail=50
+            exit 1
+          fi
           
           # Extract dag_run_id
-          DAG_RUN_ID=$(echo $TRIGGER_RESPONSE | python3 -c "import sys, json; print(json.load(sys.stdin).get('dag_run_id', 'unknown'))")
+          DAG_RUN_ID=$(echo "$RESPONSE_BODY" | python3 -c "import sys, json; print(json.load(sys.stdin).get('dag_run_id', 'unknown'))" 2>/dev/null || echo "unknown")
           echo "DAG Run ID: $DAG_RUN_ID"
+          
+          if [ "$DAG_RUN_ID" = "unknown" ]; then
+            echo "Error: Could not extract DAG Run ID"
+            exit 1
+          fi
+          
           echo "dag_run_id=$DAG_RUN_ID" >> $GITHUB_ENV
 
       - name: Wait for DAG completion
+        env:
+          AIRFLOW_API_URL: http://localhost:8080/api/v1
+          AIRFLOW_USER: ${{ env.AIRFLOW_USERNAME }}
+          AIRFLOW_PASS: ${{ env.AIRFLOW_PASSWORD }}
         run: |
           echo "Waiting for DAG to complete..."
           DAG_RUN_ID="${{ env.dag_run_id }}"
@@ -133,10 +179,11 @@ jobs:
           INTERVAL=15
           
           while [ $ELAPSED -lt $MAX_WAIT ]; do
-            STATUS_RESPONSE=$(curl -s "http://localhost:8080/api/v1/dags/currency_prediction_dag/dagRuns/$DAG_RUN_ID" \
-              -u "admin:admin")
+            STATUS_RESPONSE=$(curl -s \
+              -u "${AIRFLOW_USER}:${AIRFLOW_PASS}" \
+              "${AIRFLOW_API_URL}/dags/currency_prediction_dag/dagRuns/$DAG_RUN_ID")
             
-            STATE=$(echo $STATUS_RESPONSE | python3 -c "import sys, json; print(json.load(sys.stdin).get('state', 'unknown'))" 2>/dev/null || echo "unknown")
+            STATE=$(echo "$STATUS_RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin).get('state', 'unknown'))" 2>/dev/null || echo "unknown")
             
             echo "DAG state: $STATE (elapsed: ${ELAPSED}s)"
             
@@ -145,9 +192,13 @@ jobs:
               break
             elif [ "$STATE" = "failed" ]; then
               echo "DAG failed!"
+              echo "Response: $STATUS_RESPONSE"
               # Get task instance logs
               docker compose logs airflow-scheduler --tail=100
               exit 1
+            elif [ "$STATE" = "unknown" ]; then
+              echo "Warning: Could not determine DAG state"
+              echo "Response: $STATUS_RESPONSE"
             fi
             
             sleep $INTERVAL
