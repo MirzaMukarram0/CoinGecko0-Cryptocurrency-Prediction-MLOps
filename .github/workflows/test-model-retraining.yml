@@ -90,8 +90,9 @@ jobs:
           AIRFLOW_API_URL: http://localhost:8080/api/v1
           AIRFLOW_USER: ${{ env.AIRFLOW_USERNAME }}
           AIRFLOW_PASS: ${{ env.AIRFLOW_PASSWORD }}
+          DAG_ID: cryptocurrency_mlops_pipeline
         run: |
-          echo "Triggering currency_prediction_dag..."
+          echo "Triggering ${DAG_ID}..."
           
           # Wait for webserver health
           MAX_RETRIES=12
@@ -117,7 +118,7 @@ jobs:
           # Unpause the DAG first
           echo "Unpausing DAG..."
           UNPAUSE_RESPONSE=$(curl -s -w "\n%{http_code}" \
-            -X PATCH "${AIRFLOW_API_URL}/dags/currency_prediction_dag" \
+            -X PATCH "${AIRFLOW_API_URL}/dags/${DAG_ID}" \
             -H "Content-Type: application/json" \
             -u "${AIRFLOW_USER}:${AIRFLOW_PASS}" \
             -d '{"is_paused": false}')
@@ -137,7 +138,7 @@ jobs:
           # Trigger the DAG
           echo "Triggering DAG run..."
           TRIGGER_RESPONSE=$(curl -s -w "\n%{http_code}" \
-            -X POST "${AIRFLOW_API_URL}/dags/currency_prediction_dag/dagRuns" \
+            -X POST "${AIRFLOW_API_URL}/dags/${DAG_ID}/dagRuns" \
             -H "Content-Type: application/json" \
             -u "${AIRFLOW_USER}:${AIRFLOW_PASS}" \
             -d "{\"dag_run_id\": \"ci_run_$(date +%Y%m%d_%H%M%S)\", \"conf\": {}}")
@@ -170,6 +171,7 @@ jobs:
           AIRFLOW_API_URL: http://localhost:8080/api/v1
           AIRFLOW_USER: ${{ env.AIRFLOW_USERNAME }}
           AIRFLOW_PASS: ${{ env.AIRFLOW_PASSWORD }}
+          DAG_ID: cryptocurrency_mlops_pipeline
         run: |
           echo "Waiting for DAG to complete..."
           DAG_RUN_ID="${{ env.dag_run_id }}"
@@ -181,7 +183,7 @@ jobs:
           while [ $ELAPSED -lt $MAX_WAIT ]; do
             STATUS_RESPONSE=$(curl -s \
               -u "${AIRFLOW_USER}:${AIRFLOW_PASS}" \
-              "${AIRFLOW_API_URL}/dags/currency_prediction_dag/dagRuns/$DAG_RUN_ID")
+              "${AIRFLOW_API_URL}/dags/${DAG_ID}/dagRuns/$DAG_RUN_ID")
             
             STATE=$(echo "$STATUS_RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin).get('state', 'unknown'))" 2>/dev/null || echo "unknown")
             
@@ -259,6 +261,9 @@ jobs:
       - name: Compare with production model
         id: compare
         run: |
+          echo "Installing mlflow for comparison..."
+          pip install mlflow>=2.5.0 --quiet
+          
           echo "Comparing with production model..."
           python3 << 'EOF'
           import os
