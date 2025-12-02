@@ -40,6 +40,7 @@ warnings.filterwarnings('ignore')
 def setup_mlflow() -> str:
     """
     Setup MLflow tracking with DagHub.
+    Falls back to local tracking if remote connection fails.
     
     Returns:
         str: Experiment ID
@@ -54,6 +55,14 @@ def setup_mlflow() -> str:
     )
     mlflow_username = os.getenv('MLFLOW_TRACKING_USERNAME', 'MirzaMukarram0')
     mlflow_password = os.getenv('MLFLOW_TRACKING_PASSWORD')
+    
+    # Check if we're in CI environment or missing credentials
+    is_ci = os.getenv('CI', 'false').lower() == 'true' or os.getenv('GITHUB_ACTIONS', 'false').lower() == 'true'
+    
+    # If no password and it's a remote URI, fall back to local tracking
+    if not mlflow_password and 'dagshub.com' in mlflow_tracking_uri:
+        print("Warning: No MLFLOW_TRACKING_PASSWORD set, using local tracking")
+        mlflow_tracking_uri = 'mlruns'
     
     # Set MLflow tracking URI
     mlflow.set_tracking_uri(mlflow_tracking_uri)
@@ -76,11 +85,16 @@ def setup_mlflow() -> str:
             print(f"Using existing experiment: {experiment_name} (ID: {experiment_id})")
     except Exception as e:
         print(f"Warning: Could not get/create experiment: {e}")
-        experiment_id = "0"  # Default experiment
+        print("Falling back to local MLflow tracking")
+        mlflow.set_tracking_uri('mlruns')
+        try:
+            experiment_id = mlflow.create_experiment(experiment_name)
+        except:
+            experiment_id = "0"  # Default experiment
     
     mlflow.set_experiment(experiment_name)
     
-    print(f"MLflow tracking URI: {mlflow_tracking_uri}")
+    print(f"MLflow tracking URI: {mlflow.get_tracking_uri()}")
     print(f"MLflow experiment: {experiment_name}")
     
     return experiment_id
