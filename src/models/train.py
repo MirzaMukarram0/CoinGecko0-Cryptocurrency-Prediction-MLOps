@@ -40,6 +40,7 @@ warnings.filterwarnings('ignore')
 def setup_mlflow() -> str:
     """
     Setup MLflow tracking with DagHub.
+    Falls back to local tracking if remote connection fails.
     
     Returns:
         str: Experiment ID
@@ -55,32 +56,55 @@ def setup_mlflow() -> str:
     mlflow_username = os.getenv('MLFLOW_TRACKING_USERNAME', 'MirzaMukarram0')
     mlflow_password = os.getenv('MLFLOW_TRACKING_PASSWORD')
     
-    # Set MLflow tracking URI
-    mlflow.set_tracking_uri(mlflow_tracking_uri)
-    
-    # Set authentication environment variables
-    os.environ['MLFLOW_TRACKING_USERNAME'] = mlflow_username
-    if mlflow_password:
-        os.environ['MLFLOW_TRACKING_PASSWORD'] = mlflow_password
-    
     # Set or create experiment
     experiment_name = "crypto-price-prediction"
     
-    try:
-        experiment = mlflow.get_experiment_by_name(experiment_name)
-        if experiment is None:
-            experiment_id = mlflow.create_experiment(experiment_name)
-            print(f"Created new experiment: {experiment_name} (ID: {experiment_id})")
-        else:
-            experiment_id = experiment.experiment_id
-            print(f"Using existing experiment: {experiment_name} (ID: {experiment_id})")
-    except Exception as e:
-        print(f"Warning: Could not get/create experiment: {e}")
-        experiment_id = "0"  # Default experiment
+    # Try remote MLflow first, fall back to local if it fails
+    use_local = False
+    
+    if mlflow_password and 'dagshub.com' in mlflow_tracking_uri:
+        # Try to connect to DagHub
+        mlflow.set_tracking_uri(mlflow_tracking_uri)
+        os.environ['MLFLOW_TRACKING_USERNAME'] = mlflow_username
+        os.environ['MLFLOW_TRACKING_PASSWORD'] = mlflow_password
+        
+        try:
+            # Test connection by getting experiments
+            experiment = mlflow.get_experiment_by_name(experiment_name)
+            if experiment is None:
+                experiment_id = mlflow.create_experiment(experiment_name)
+                print(f"Created new experiment on DagHub: {experiment_name} (ID: {experiment_id})")
+            else:
+                experiment_id = experiment.experiment_id
+                print(f"Using existing experiment on DagHub: {experiment_name} (ID: {experiment_id})")
+        except Exception as e:
+            print(f"Warning: Could not connect to DagHub MLflow: {e}")
+            print("Falling back to local MLflow tracking...")
+            use_local = True
+    else:
+        print("No DagHub credentials found, using local MLflow tracking")
+        use_local = True
+    
+    if use_local:
+        # Use local file-based MLflow tracking
+        local_tracking_uri = '/opt/airflow/mlruns'
+        mlflow.set_tracking_uri(f'file://{local_tracking_uri}')
+        
+        try:
+            experiment = mlflow.get_experiment_by_name(experiment_name)
+            if experiment is None:
+                experiment_id = mlflow.create_experiment(experiment_name)
+                print(f"Created new local experiment: {experiment_name} (ID: {experiment_id})")
+            else:
+                experiment_id = experiment.experiment_id
+                print(f"Using existing local experiment: {experiment_name} (ID: {experiment_id})")
+        except Exception as e:
+            print(f"Warning: Could not setup local experiment: {e}")
+            experiment_id = "0"  # Default experiment
     
     mlflow.set_experiment(experiment_name)
     
-    print(f"MLflow tracking URI: {mlflow_tracking_uri}")
+    print(f"MLflow tracking URI: {mlflow.get_tracking_uri()}")
     print(f"MLflow experiment: {experiment_name}")
     
     return experiment_id
@@ -370,7 +394,18 @@ class CryptoPricePredictor:
         best_model = None
         best_rmse = float('inf')
         
-        with mlflow.start_run(run_name=run_name) as parent_run:
+        # Try to start MLflow run, fall back to local if remote fails
+        try:
+            parent_run_context = mlflow.start_run(run_name=run_name)
+        except Exception as e:
+            print(f"Warning: Failed to start MLflow run on remote server: {e}")
+            print("Switching to local MLflow tracking...")
+            # Switch to local tracking
+            mlflow.set_tracking_uri('file:///opt/airflow/mlruns')
+            mlflow.set_experiment("crypto-price-prediction")
+            parent_run_context = mlflow.start_run(run_name=run_name)
+        
+        with parent_run_context as parent_run:
             # Log dataset info
             mlflow.log_param("dataset_size", len(df))
             mlflow.log_param("n_features", len(self.feature_columns))

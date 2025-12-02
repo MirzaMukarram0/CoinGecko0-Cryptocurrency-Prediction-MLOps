@@ -1,0 +1,4 @@
+outs:
+- md5: 3f9ed6f3eb30a3db391cf594500fb62b
+  path: processed_20251202_144957.csv
+  size: 29276
